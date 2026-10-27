@@ -1,0 +1,36 @@
+**/bin/
+**/obj/
+.vs/
+.artifacts/
+*.user
+.env
+.env.*
+!.env.example
+
+# Local secrets and machine-specific configuration
+secrets.json
+secrets.*.json
+appsettings.Local.json
+appsettings.*.Local.json
+*.dpapi
+sql-password.dpapi
+start-mcp.ps1
+
+# Local database files
+Database/
+*.mdf
+*.ldf
+
+# Test and coverage artifacts
+TestResults/
+*.trx
+coverage/
+coverage.*
+*.coverage
+*.coveragexml
+
+# Temporary launcher and scratch files
+*.tmp
+*.temp
+*.bak
+*.log
