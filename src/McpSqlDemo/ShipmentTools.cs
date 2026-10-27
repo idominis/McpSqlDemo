@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
@@ -20,7 +19,7 @@ public static class ShipmentTools
         logger.LogInformation("Tool call started for {ToolName} with shipment ID {ShipmentId}",
             nameof(GetShipmentById), shipmentId);
 
-        if (shipmentId is < 1 or > 1_000_000)
+        if (!ShipmentInputValidation.IsValidShipmentId(shipmentId))
         {
             logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType}",
                 nameof(GetShipmentById), "InvalidInput");
@@ -44,7 +43,12 @@ public static class ShipmentTools
                 nameof(GetShipmentById), "DeadlineExceeded");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (SqlException exception)
+        catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
+        {
+            LogDatabaseFailure(logger, nameof(GetShipmentById), exception, "DatabaseTimeout");
+            throw new McpException("The shipment operation timed out. Please try again later.");
+        }
+        catch (ShipmentDatabaseException exception)
         {
             LogDatabaseFailure(logger, nameof(GetShipmentById), exception);
             throw new McpException("The shipment database operation failed. Please try again later.");
@@ -97,7 +101,12 @@ public static class ShipmentTools
                 nameof(ListShipments), "DeadlineExceeded");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (SqlException exception)
+        catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
+        {
+            LogDatabaseFailure(logger, nameof(ListShipments), exception, "DatabaseTimeout");
+            throw new McpException("The shipment operation timed out. Please try again later.");
+        }
+        catch (ShipmentDatabaseException exception)
         {
             LogDatabaseFailure(logger, nameof(ListShipments), exception);
             throw new McpException("The shipment database operation failed. Please try again later.");
@@ -120,9 +129,7 @@ public static class ShipmentTools
     {
         var logger = loggerFactory.CreateLogger("ShipmentTools");
 
-        string? canonicalStatus = null;
-        if (status is not null && status.Length <= 50)
-            canonicalStatus = NormalizeStatus(status);
+        var canonicalStatus = ShipmentInputValidation.NormalizeStatus(status);
 
         if (canonicalStatus is null)
         {
@@ -154,9 +161,16 @@ public static class ShipmentTools
                 nameof(GetShipmentsByStatus), "DeadlineExceeded", canonicalStatus);
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (SqlException exception)
+        catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
         {
-            LogDatabaseFailure(logger, nameof(GetShipmentsByStatus), exception, canonicalStatus);
+            LogDatabaseFailure(
+                logger, nameof(GetShipmentsByStatus), exception, "DatabaseTimeout", canonicalStatus);
+            throw new McpException("The shipment operation timed out. Please try again later.");
+        }
+        catch (ShipmentDatabaseException exception)
+        {
+            LogDatabaseFailure(
+                logger, nameof(GetShipmentsByStatus), exception, canonicalStatus: canonicalStatus);
             throw new McpException("The shipment database operation failed. Please try again later.");
         }
         catch (Exception exception)
@@ -166,35 +180,15 @@ public static class ShipmentTools
         }
     }
 
-    private static string? NormalizeStatus(string status)
-    {
-        var value = status.AsSpan();
-        var start = 0;
-        while (start < value.Length && char.IsWhiteSpace(value[start]))
-            start++;
-
-        var end = value.Length - 1;
-        while (end >= start && char.IsWhiteSpace(value[end]))
-            end--;
-
-        value = value[start..(end + 1)];
-        if (value.Equals("Pending", StringComparison.OrdinalIgnoreCase))
-            return "Pending";
-        if (value.Equals("Loading", StringComparison.OrdinalIgnoreCase))
-            return "Loading";
-        if (value.Equals("Completed", StringComparison.OrdinalIgnoreCase))
-            return "Completed";
-        return null;
-    }
-
     private static void LogDatabaseFailure(
         ILogger logger,
         string toolName,
-        SqlException exception,
+        ShipmentDatabaseException exception,
+        string failureType = "DatabaseFailure",
         string? canonicalStatus = null) =>
         logger.LogError(
             "Tool call failed for {ToolName} with failure type {FailureType}, SQL number {SqlNumber}, state {SqlState}, class {SqlClass}, and canonical status {ShipmentStatus}",
-            toolName, "DatabaseFailure", exception.Number, exception.State, exception.Class, canonicalStatus);
+            toolName, failureType, exception.Number, exception.State, exception.Class, canonicalStatus);
 
     private static void LogUnexpectedFailure(
         ILogger logger,

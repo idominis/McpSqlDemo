@@ -83,6 +83,8 @@ public sealed class ShipmentToolsTests
     [InlineData("")]
     [InlineData("   ")]
     [InlineData("InTransit")]
+    [InlineData("Pending' OR 1=1--")]
+    [InlineData("Completed'; DROP TABLE dbo.Shipments;--")]
     public async Task GetShipmentsByStatus_WithInvalidStatus_ThrowsWithoutCallingRepository(string? status)
     {
         var repository = new FakeShipmentRepository();
@@ -168,6 +170,52 @@ public sealed class ShipmentToolsTests
     }
 
     [Fact]
+    public async Task GetShipmentById_WhenRepositoryFails_DoesNotExposeSensitiveDetails()
+    {
+        const string sensitiveDetail =
+            "Server=private-host;User ID=mcp_app_reader;Password=do-not-leak; at Secret.Namespace.Repository";
+        var repository = new FakeShipmentRepository
+        {
+            GetByIdHandler = (_, _) => throw new InvalidOperationException(sensitiveDetail)
+        };
+        using var executionPolicy = CreateExecutionPolicy();
+        var messages = new List<string>();
+        using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+            builder => builder.AddProvider(new RecordingLoggerProvider(messages)));
+
+        var exception = await Assert.ThrowsAsync<McpException>(() =>
+            ShipmentTools.GetShipmentById(
+                repository, executionPolicy, loggerFactory, 42, CancellationToken.None));
+
+        Assert.Equal("The shipment operation failed. Please try again later.", exception.Message);
+        AssertSafeClientError(exception.Message, sensitiveDetail);
+        Assert.DoesNotContain(messages, message =>
+            message.Contains(sensitiveDetail, StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("Password", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(messages, message =>
+            message.Contains("UnexpectedFailure", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetShipmentsByStatus_WhenRepositoryFails_DoesNotExposeSensitiveDetails()
+    {
+        const string sensitiveDetail =
+            "Data Source=private-host;Initial Catalog=McpSqlDemo;Password=do-not-leak; stack trace";
+        var repository = new FakeShipmentRepository
+        {
+            GetByStatusHandler = (_, _) => throw new InvalidOperationException(sensitiveDetail)
+        };
+        using var executionPolicy = CreateExecutionPolicy();
+
+        var exception = await Assert.ThrowsAsync<McpException>(() =>
+            ShipmentTools.GetShipmentsByStatus(
+                repository, executionPolicy, LoggerFactory, "Pending", CancellationToken.None));
+
+        Assert.Equal("The shipment operation failed. Please try again later.", exception.Message);
+        AssertSafeClientError(exception.Message, sensitiveDetail);
+    }
+
+    [Fact]
     public async Task ListShipments_WhenDeadlineExpires_ReturnsSafeTimeoutError()
     {
         var repository = new FakeShipmentRepository
@@ -179,11 +227,84 @@ public sealed class ShipmentToolsTests
             }
         };
         using var executionPolicy = CreateExecutionPolicy(deadline: TimeSpan.FromMilliseconds(50));
+        var messages = new List<string>();
+        using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+            builder => builder.AddProvider(new RecordingLoggerProvider(messages)));
 
         var exception = await Assert.ThrowsAsync<McpException>(() =>
-            ShipmentTools.ListShipments(repository, executionPolicy, LoggerFactory, CancellationToken.None));
+            ShipmentTools.ListShipments(
+                repository, executionPolicy, loggerFactory, CancellationToken.None));
 
         Assert.Equal("The shipment operation timed out. Please try again later.", exception.Message);
+        AssertSafeClientError(exception.Message, "TimeoutException at private-host");
+        Assert.Contains(messages, message =>
+            message.Contains("DeadlineExceeded", StringComparison.Ordinal));
+        Assert.DoesNotContain(messages, message =>
+            message.Contains("DatabaseTimeout", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ListShipments_WhenSqlCommandTimesOut_ReturnsSafeTimeoutErrorAndLogsNumericDiagnostics()
+    {
+        const string sensitiveDetail =
+            "Server=private-host;Password=do-not-leak; command timeout stack trace";
+        var repository = new FakeShipmentRepository
+        {
+            ListHandler = _ => throw ShipmentDatabaseException.FromSqlDiagnostics(
+                ShipmentDatabaseException.CommandTimeoutSqlNumber,
+                state: 1,
+                errorClass: 11,
+                innerException: new InvalidOperationException(sensitiveDetail))
+        };
+        using var executionPolicy = CreateExecutionPolicy();
+        var messages = new List<string>();
+        using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+            builder => builder.AddProvider(new RecordingLoggerProvider(messages)));
+
+        var exception = await Assert.ThrowsAsync<McpException>(() =>
+            ShipmentTools.ListShipments(
+                repository, executionPolicy, loggerFactory, CancellationToken.None));
+
+        Assert.Equal("The shipment operation timed out. Please try again later.", exception.Message);
+        AssertSafeClientError(exception.Message, sensitiveDetail);
+        Assert.DoesNotContain(messages, message =>
+            message.Contains(sensitiveDetail, StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("Password", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(messages, message =>
+            message.Contains("DatabaseTimeout", StringComparison.Ordinal) &&
+            message.Contains("-2", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ListShipments_WhenDatabaseFails_ReturnsSafeDatabaseErrorAndLogsNumericDiagnostics()
+    {
+        const string sensitiveDetail =
+            "Server=private-host;Password=do-not-leak; login failure stack trace";
+        var repository = new FakeShipmentRepository
+        {
+            ListHandler = _ => throw ShipmentDatabaseException.FromSqlDiagnostics(
+                number: 18456,
+                state: 1,
+                errorClass: 14,
+                innerException: new InvalidOperationException(sensitiveDetail))
+        };
+        using var executionPolicy = CreateExecutionPolicy();
+        var messages = new List<string>();
+        using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+            builder => builder.AddProvider(new RecordingLoggerProvider(messages)));
+
+        var exception = await Assert.ThrowsAsync<McpException>(() =>
+            ShipmentTools.ListShipments(
+                repository, executionPolicy, loggerFactory, CancellationToken.None));
+
+        Assert.Equal("The shipment database operation failed. Please try again later.", exception.Message);
+        AssertSafeClientError(exception.Message, sensitiveDetail);
+        Assert.DoesNotContain(messages, message =>
+            message.Contains(sensitiveDetail, StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("Password", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(messages, message =>
+            message.Contains("DatabaseFailure", StringComparison.Ordinal) &&
+            message.Contains("18456", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -285,6 +406,16 @@ public sealed class ShipmentToolsTests
         TimeSpan? deadline = null,
         int maxConcurrency = 4) =>
         new(new SecuritySettings(5, 10, deadline ?? TimeSpan.FromSeconds(5), maxConcurrency));
+
+    private static void AssertSafeClientError(string message, string sensitiveDetail)
+    {
+        Assert.DoesNotContain(sensitiveDetail, message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Password", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Server=", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Data Source=", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stack trace", message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(" at ", message, StringComparison.OrdinalIgnoreCase);
+    }
 
     private static void UpdateMaximum(ref int maximum, int candidate)
     {

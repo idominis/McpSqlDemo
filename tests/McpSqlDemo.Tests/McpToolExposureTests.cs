@@ -30,6 +30,15 @@ public sealed class McpToolExposureTests
         Assert.Equal(["shipmentId"], GetClientParameterNames(tools, "get_shipment_by_id"));
         Assert.Equal(["status"], GetClientParameterNames(tools, "get_shipments_by_status"));
         Assert.Empty(GetClientParameterNames(tools, "list_shipments"));
+
+        Assert.All(tools, tool =>
+        {
+            Assert.True(tool.ProtocolTool.Annotations?.ReadOnlyHint);
+            Assert.False(tool.ProtocolTool.Annotations?.DestructiveHint);
+        });
+
+        Assert.Equal("integer", GetClientParameterType(tools, "get_shipment_by_id", "shipmentId"));
+        Assert.Equal("string", GetClientParameterType(tools, "get_shipments_by_status", "status"));
     }
 
     private static string[] GetClientParameterNames(McpServerTool[] tools, string toolName)
@@ -41,5 +50,19 @@ public sealed class McpToolExposureTests
             .Select(property => property.Name)
             .Order(StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private static string GetClientParameterType(
+        McpServerTool[] tools,
+        string toolName,
+        string parameterName)
+    {
+        var tool = Assert.Single(tools, candidate => candidate.ProtocolTool.Name == toolName);
+        using var schema = JsonDocument.Parse(JsonSerializer.Serialize(tool.ProtocolTool.InputSchema));
+        return schema.RootElement
+            .GetProperty("properties")
+            .GetProperty(parameterName)
+            .GetProperty("type")
+            .GetString()!;
     }
 }

@@ -48,6 +48,21 @@ public sealed class ShipmentRepositoryIntegrationTests
         Assert.Equal(matches.OrderBy(shipment => shipment.Id), matches);
     }
 
+    [LocalDbFact]
+    public async Task GetByStatusAsync_WithSqlInjectionPayload_IsRejectedAndDoesNotAffectData()
+    {
+        var repository = CreateRepository();
+        var before = await repository.ListAsync(CancellationToken.None);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            repository.GetByStatusAsync(
+                "Pending'; DELETE FROM dbo.Shipments;--",
+                CancellationToken.None));
+
+        var after = await repository.ListAsync(CancellationToken.None);
+        Assert.Equal(before, after);
+    }
+
     private static ShipmentRepository CreateRepository() =>
         new(NullLogger<ShipmentRepository>.Instance, SecuritySettings.FromEnvironment());
 }

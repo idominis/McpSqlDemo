@@ -98,6 +98,10 @@ public sealed class ShipmentToolExecutionPolicy : IDisposable
         {
             throw new ShipmentToolDeadlineExceededException(exception);
         }
+        catch (SqlException exception)
+        {
+            throw ShipmentDatabaseException.FromSqlException(exception);
+        }
         finally
         {
             if (permitAcquired)
@@ -106,6 +110,38 @@ public sealed class ShipmentToolExecutionPolicy : IDisposable
     }
 
     public void Dispose() => _semaphore.Dispose();
+}
+
+internal sealed class ShipmentDatabaseException : Exception
+{
+    internal const int CommandTimeoutSqlNumber = -2;
+
+    private ShipmentDatabaseException(
+        int number,
+        byte state = 0,
+        byte errorClass = 0,
+        Exception? innerException = null)
+        : base("The shipment database operation failed.", innerException)
+    {
+        Number = number;
+        State = state;
+        Class = errorClass;
+    }
+
+    public int Number { get; }
+    public byte State { get; }
+    public byte Class { get; }
+    public bool IsCommandTimeout => Number == CommandTimeoutSqlNumber;
+
+    internal static ShipmentDatabaseException FromSqlDiagnostics(
+        int number,
+        byte state = 0,
+        byte errorClass = 0,
+        Exception? innerException = null) =>
+        new(number, state, errorClass, innerException);
+
+    internal static ShipmentDatabaseException FromSqlException(SqlException exception) =>
+        FromSqlDiagnostics(exception.Number, exception.State, exception.Class, exception);
 }
 
 internal sealed class ShipmentToolDeadlineExceededException : Exception
