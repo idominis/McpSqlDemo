@@ -1,5 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
+export const MAX_TOOL_RESULT_BYTES = 64 * 1024;
+
 export class McpResponseError extends Error {
   public constructor(message: string) {
     super(message);
@@ -7,7 +9,7 @@ export class McpResponseError extends Error {
   }
 }
 
-export function readJsonToolResult(result: CallToolResult): unknown {
+export function readJsonToolResult(result: CallToolResult, maximumBytes = Number.POSITIVE_INFINITY): unknown {
   const textBlocks = result.content.filter(
     (block): block is Extract<(typeof result.content)[number], { type: "text" }> =>
       block.type === "text",
@@ -23,6 +25,10 @@ export function readJsonToolResult(result: CallToolResult): unknown {
   const textBlock = textBlocks[0];
   if (textBlock === undefined) {
     throw new McpResponseError("The MCP server returned an unexpected response format.");
+  }
+
+  if (Buffer.byteLength(textBlock.text, "utf8") > maximumBytes) {
+    throw new McpResponseError("The MCP server returned a result that was too large.");
   }
 
   try {

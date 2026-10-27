@@ -38,4 +38,15 @@ describe("readJsonToolResult", () => {
     assert.throws(() => readJsonToolResult({ content: [{ type: "text", text: "not json" }] }), McpResponseError);
     assert.throws(() => readJsonToolResult({ content: [] }), McpResponseError);
   });
+
+  it("preserves the legacy CLI's unbounded parser unless a caller supplies a limit", () => {
+    const payload = JSON.stringify({ value: "x".repeat(70_000) });
+    assert.deepEqual(readJsonToolResult({ content: [{ type: "text", text: payload }] }), {
+      value: "x".repeat(70_000),
+    });
+    assert.throws(
+      () => readJsonToolResult({ content: [{ type: "text", text: payload }] }, 64 * 1024),
+      /too large/,
+    );
+  });
 });

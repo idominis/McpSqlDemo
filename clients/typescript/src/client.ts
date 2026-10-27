@@ -47,7 +47,11 @@ export function createLauncherEnvironment(): Record<string, string> {
   return environment;
 }
 
-type ServerParameters = ConstructorParameters<typeof StdioClientTransport>[0];
+export type ServerParameters = ConstructorParameters<typeof StdioClientTransport>[0];
+
+export async function createConfiguredLauncherServerParameters(): Promise<ServerParameters> {
+  return createLauncherServerParameters(await getLauncherPath());
+}
 
 /** Used by tests to exercise the real MCP stdio transport without the protected launcher. */
 export async function runCommandWithServer(
