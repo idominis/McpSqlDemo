@@ -34,6 +34,13 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+
       - name: Restore projects
         run: |
           dotnet restore src/McpSqlDemo/McpSqlDemo.csproj
@@ -52,3 +59,21 @@ jobs:
 
       - name: Test tool poisoning lab
         run: dotnet test labs/ToolPoisoningLab.Tests/ToolPoisoningLab.Tests.csproj --configuration Release --no-restore
+
+      - name: Install TypeScript client dependencies
+        working-directory: clients/typescript
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck TypeScript client
+        working-directory: clients/typescript
+        run: npm run typecheck
+
+      - name: Build TypeScript client
+        working-directory: clients/typescript
+        run: npm run build
+
+      - name: Test TypeScript client
+        working-directory: clients/typescript
+        env:
+          MCP_SERVER_LAUNCHER_PATH: ""
+        run: npm test

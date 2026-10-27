@@ -125,9 +125,15 @@ finally {
 
 This test launches the built `McpSqlDemo.dll` through the official .NET MCP stdio client, invokes `list_shipments`, and forwards only a curated process environment plus `MCP_SQL_CONNECTION`. It does not print or persist the connection string. Child-process stderr is reduced to sanitized event counters, and the child is terminated during client disposal. The test is skipped unless both `MCP_SQL_CONNECTION` is present and `MCP_SQL_RUN_STDIO_INTEGRATION` is exactly `1`.
 
+## TypeScript MCP client
+
+`clients/typescript` contains a strict TypeScript/Node.js CLI that initializes an MCP session over stdio, lists tools, and calls all three shipment tools through the existing external secure PowerShell launcher. It never needs direct access to DPAPI data or SQL configuration. On Windows, the client preserves the SDK's restricted default child environment and additionally forwards only `PATHEXT`, which PowerShell needs to resolve executable file types reliably.
+
+After running `npm ci` in that directory, set `MCP_SERVER_LAUNCHER_PATH` to the launcher's absolute `.ps1` path and use `npm run dev -- list`, `get 1`, `status Pending`, or `tools`. See [the TypeScript client README](clients/typescript/README.md) for setup, security behavior, and checks.
+
 ## Continuous integration
 
-GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets.
+GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. It also installs Node.js LTS and runs `npm ci`, typechecking, build, and isolated unit tests for the TypeScript client. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection, no launcher path, and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets and never starts the real launcher.
 
 ## Architecture
 Codex (MCP client) -> stdio -> C# MCP server -> SqlClient (parameterized SELECT) -> SQL Server test DB.
