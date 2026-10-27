@@ -125,6 +125,10 @@ finally {
 
 This test launches the built `McpSqlDemo.dll` through the official .NET MCP stdio client, invokes `list_shipments`, and forwards only a curated process environment plus `MCP_SQL_CONNECTION`. It does not print or persist the connection string. Child-process stderr is reduced to sanitized event counters, and the child is terminated during client disposal. The test is skipped unless both `MCP_SQL_CONNECTION` is present and `MCP_SQL_RUN_STDIO_INTEGRATION` is exactly `1`.
 
+## Continuous integration
+
+GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets.
+
 ## Architecture
 Codex (MCP client) -> stdio -> C# MCP server -> SqlClient (parameterized SELECT) -> SQL Server test DB.
 

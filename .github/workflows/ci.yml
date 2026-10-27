@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      MCP_SQL_CONNECTION: ""
+      MCP_SQL_VERIFY_LEAST_PRIVILEGE: "0"
+      MCP_SQL_RUN_STDIO_INTEGRATION: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore projects
+        run: |
+          dotnet restore src/McpSqlDemo/McpSqlDemo.csproj
+          dotnet restore tests/McpSqlDemo.Tests/McpSqlDemo.Tests.csproj
+          dotnet restore labs/PromptInjectionLab.Tests/PromptInjectionLab.Tests.csproj
+          dotnet restore labs/ToolPoisoningLab.Tests/ToolPoisoningLab.Tests.csproj
+
+      - name: Build MCP server
+        run: dotnet build src/McpSqlDemo/McpSqlDemo.csproj --configuration Release --no-restore
+
+      - name: Test MCP server
+        run: dotnet test tests/McpSqlDemo.Tests/McpSqlDemo.Tests.csproj --configuration Release --no-restore
+
+      - name: Test prompt injection lab
+        run: dotnet test labs/PromptInjectionLab.Tests/PromptInjectionLab.Tests.csproj --configuration Release --no-restore
+
+      - name: Test tool poisoning lab
+        run: dotnet test labs/ToolPoisoningLab.Tests/ToolPoisoningLab.Tests.csproj --configuration Release --no-restore
