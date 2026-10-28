@@ -143,6 +143,10 @@ The model performs intent recognition and selects at most one locally defined fu
 
 Set `MCP_AGENT_DIAGNOSTICS=1` to emit sanitized JSONL events to stderr; diagnostics are otherwise disabled and shipment output remains on stdout. One locally generated correlation ID connects initialization, model selection, optional MCP execution, validation/formatting, and completion events. Questions, prompts, arguments, model/MCP payloads, shipment or SQL data, secrets, raw failures, and sensitive paths are excluded by construction. See [Secure local diagnostics](clients/typescript/README.md#secure-local-diagnostics-phase-5a) for examples, privacy boundaries, and API-key-free verification.
 
+### Model resilience (Phase 5B)
+
+The secure agent uses one model attempt by default. Setting `MCP_MODEL_MAX_ATTEMPTS=2` permits at most one retry, only for validated OpenAI SDK HTTP 429/500/502/503/504 failures and only within the existing 20-second model-stage deadline. The retry wrapper never includes MCP initialization, tool execution, SQL, validation, or formatting, and the request still executes at most one MCP tool. See [Secure AI tool selection](clients/typescript/README.md#secure-ai-tool-selection-phase-4b) for the exact backoff, deadline, diagnostics, and non-retry rules.
+
 ## Continuous integration
 
 GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. It also installs Node.js LTS and runs `npm ci`, typechecking, build, and isolated unit tests for the TypeScript client. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection, no launcher path, and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets and never starts the real launcher.

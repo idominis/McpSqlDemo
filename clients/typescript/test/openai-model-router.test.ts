@@ -6,6 +6,7 @@ import {
   DEFAULT_OPENAI_MODEL,
   MAX_MODEL_OUTPUT_TOKENS,
   OpenAIModelRouter,
+  isRetryableOpenAIError,
   openAIErrorCategory,
   parseOpenAIResponse,
   parseOpenAIUsage,
@@ -89,6 +90,55 @@ describe("OpenAI Responses model router", () => {
     for (const value of malformed) assert.deepEqual(parseOpenAIUsage(value), { kind: "unavailable" });
   });
 
+  it("fails closed before provider dispatch for invalid budgets, expired deadlines, and cancellation", async () => {
+    let requests = 0;
+    const router = new OpenAIModelRouter({ async create() { requests += 1; return {}; } }, DEFAULT_OPENAI_MODEL);
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await assert.rejects(router.selectTool("x", [], new AbortController().signal, { timeoutMs }), /deadline exhausted/i);
+    }
+    await assert.rejects(router.selectTool("x", [], new AbortController().signal, {
+      timeoutMs: 10, deadlineMs: 5, monotonicNow: () => 5,
+    }), /deadline exhausted/i);
+    const canceled = new AbortController();
+    canceled.abort();
+    await assert.rejects(router.selectTool("x", [], canceled.signal, { timeoutMs: 10 }));
+    assert.equal(requests, 0);
+  });
+
+  it("enforces the final minimum dispatch budget without changing positive first-attempt budgets", async () => {
+    const dispatchedTimeouts: number[] = [];
+    const router = new OpenAIModelRouter({ async create(_body, options) {
+      dispatchedTimeouts.push(options.timeout);
+      return { status: "completed", output: [] };
+    } }, DEFAULT_OPENAI_MODEL);
+
+    await router.selectTool("x", [], new AbortController().signal, { timeoutMs: 1 });
+    await router.selectTool("x", [], new AbortController().signal, {
+      timeoutMs: 1_500, deadlineMs: 1_000, monotonicNow: () => 0, minimumDispatchBudgetMs: 1_000,
+    });
+    assert.deepEqual(dispatchedTimeouts, [1, 1_000]);
+
+    for (const remainingMs of [999, 0, -1]) {
+      await assert.rejects(router.selectTool("x", [], new AbortController().signal, {
+        timeoutMs: 1_500, deadlineMs: remainingMs, monotonicNow: () => 0, minimumDispatchBudgetMs: 1_000,
+      }), /deadline exhausted/i);
+    }
+    for (const minimumDispatchBudgetMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await assert.rejects(router.selectTool("x", [], new AbortController().signal, {
+        timeoutMs: 1_500, minimumDispatchBudgetMs,
+      }), /deadline exhausted/i);
+    }
+
+    const canceled = new AbortController();
+    await assert.rejects(router.selectTool("x", [], canceled.signal, {
+      timeoutMs: 1_500,
+      deadlineMs: 1_000,
+      monotonicNow: () => { canceled.abort(); return 0; },
+      minimumDispatchBudgetMs: 1_000,
+    }));
+    assert.deepEqual(dispatchedTimeouts, [1, 1_000]);
+  });
+
   it("classifies only trusted SDK errors and validated HTTP statuses", async () => {
     const headers = new Headers();
     const cases: ReadonlyArray<readonly [unknown, string]> = [
@@ -108,6 +158,14 @@ describe("OpenAI Responses model router", () => {
     for (const [failure, category] of cases) {
       assert.equal(await categoryFromFailedRequest(failure), category);
     }
+  });
+
+  it("retries only the explicitly approved trusted HTTP statuses", async () => {
+    for (const status of [429, 500, 502, 503, 504]) assert.equal(await retryableFromFailedRequest(new APIError(status, {}, "private", new Headers())), true);
+    for (const status of [400, 401, 403, 404, 501, 505, 599]) assert.equal(await retryableFromFailedRequest(new APIError(status, {}, "private", new Headers())), false);
+    assert.equal(await retryableFromFailedRequest(new APIConnectionError({ cause: new Error("private") })), false);
+    assert.equal(await retryableFromFailedRequest(new APIConnectionTimeoutError()), false);
+    assert.equal(await retryableFromFailedRequest(new Error("503")), false);
   });
 
   it("treats missing and malformed SDK status values as unknown", async () => {
@@ -131,6 +189,16 @@ async function categoryFromFailedRequest(failure: unknown): Promise<string | und
     await router.selectTool("offline test", TRUSTED_MODEL_TOOLS, new AbortController().signal);
   } catch (error: unknown) {
     return openAIErrorCategory(error);
+  }
+  assert.fail("Expected the offline client to reject.");
+}
+
+async function retryableFromFailedRequest(failure: unknown): Promise<boolean> {
+  const router = new OpenAIModelRouter({ async create() { throw failure; } }, DEFAULT_OPENAI_MODEL);
+  try {
+    await router.selectTool("offline test", TRUSTED_MODEL_TOOLS, new AbortController().signal);
+  } catch (error: unknown) {
+    return isRetryableOpenAIError(error);
   }
   assert.fail("Expected the offline client to reject.");
 }

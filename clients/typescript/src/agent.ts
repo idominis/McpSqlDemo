@@ -8,7 +8,7 @@ import {
   type ShipmentStatus,
   type TrustedToolName,
 } from "./contracts.js";
-import type { ModelRouter, ModelSelection, ModelUsage } from "./model-router.js";
+import type { ModelAttemptDiagnostic, ModelReliability, ModelRouter, ModelSelection, ModelUsage } from "./model-router.js";
 import { AgentDiagnostics, type CompletionKind, type DiagnosticsOptions, type OperationalOutcome } from "./observability.js";
 import { openAIErrorCategory, type OpenAIErrorCategory } from "./openai-model-router.js";
 import { MAX_TOOL_RESULT_BYTES, readJsonToolResult } from "./response.js";
@@ -144,13 +144,21 @@ async function runAgentCore(
 
   const modelStart = diagnostics.monotonicNow();
   let usage: ModelUsage = { kind: "unavailable" };
+  let reliability: ModelReliability | undefined;
   let errorCategory: OpenAIErrorCategory | undefined;
+  let lastAttempt: ModelAttemptDiagnostic | undefined;
   let call: ValidatedCall | undefined;
   try {
     const modelResult = await runStage(
       async (signal) => {
         try {
-          return await router.selectTool(question, TRUSTED_MODEL_TOOLS, signal);
+          return await router.selectTool(question, TRUSTED_MODEL_TOOLS, signal, {
+            timeoutMs: limits.modelMs,
+            onAttempt: (attempt) => {
+              lastAttempt = attempt;
+              diagnostics.modelAttemptCompleted(attempt);
+            },
+          });
         } catch (error: unknown) {
           errorCategory = openAIErrorCategory(error);
           throw error;
@@ -159,11 +167,15 @@ async function runAgentCore(
       "model_timeout", "model_failed", callerSignal,
     );
     usage = modelResult.usage;
+    reliability = modelResult.reliability;
     const selection = modelResult.selection;
     if (selection.kind !== "none") call = validateSelection(selection);
-    diagnostics.modelSelectionCompleted("success", diagnostics.durationSince(modelStart), usage);
+    diagnostics.modelSelectionCompleted("success", diagnostics.durationSince(modelStart), usage, undefined, reliability);
   } catch (error: unknown) {
-    diagnostics.modelSelectionCompleted(outcomeForError(error), diagnostics.durationSince(modelStart), usage, errorCategory);
+    diagnostics.modelSelectionCompleted(
+      outcomeForError(error), diagnostics.durationSince(modelStart), usage, errorCategory,
+      reliability ?? failedReliability(lastAttempt),
+    );
     throw error;
   }
 
@@ -200,6 +212,16 @@ async function runAgentCore(
     diagnostics.validationFormattingCompleted(outcomeForError(normalized), diagnostics.durationSince(formattingStart));
     throw normalized;
   }
+}
+
+function failedReliability(attempt: ModelAttemptDiagnostic | undefined): ModelReliability | undefined {
+  if (attempt === undefined) return undefined;
+  return {
+    attemptCount: attempt.attempt,
+    maximumAttempts: attempt.maximumAttempts,
+    usageCompleteness: "incomplete",
+    postResponseBudgetOutcome: "unknown",
+  };
 }
 
 function validateQuestion(question: string): void {

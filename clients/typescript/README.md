@@ -51,11 +51,13 @@ All successful tool payloads are parsed from the server's existing JSON text res
 
 ## Secure AI tool selection (Phase 4B)
 
-The agent discovers exactly `list_shipments`, `get_shipment_by_id`, and `get_shipments_by_status`, validates their schemas against local contracts, and sends only locally controlled function names, descriptions, and strict schemas to OpenAI. A small provider-neutral `ModelRouter` interface keeps a future local/Ollama adapter possible without introducing an agent framework. It permits one Responses API request and zero or one MCP tool call. Parallel calls are disabled. Arbitrary model text is never displayed, and shipment results are never returned to OpenAI.
+The agent discovers exactly `list_shipments`, `get_shipment_by_id`, and `get_shipments_by_status`, validates their schemas against local contracts, and sends only locally controlled function names, descriptions, and strict schemas to OpenAI. A small provider-neutral `ModelRouter` interface keeps a future local/Ollama adapter possible without introducing an agent framework. `ReliableModelSelector` wraps only model selection; MCP initialization, MCP execution, validation, formatting, SQL, and shutdown stay outside its retry boundary. Parallel calls are disabled. Arbitrary model text is never displayed, and shipment results are never returned to OpenAI.
 
 The official `openai` package is pinned exactly to `6.49.0`. The default model is the pinned `gpt-5.4-mini-2026-03-17` snapshot. `OPENAI_MODEL` may be set only to that snapshot or `gpt-5.4-mini`; other values fail before a request. OpenAI's model documentation lists Responses and function calling support for this model: [GPT-5.4 mini](https://developers.openai.com/api/docs/models/gpt-5.4-mini).
 
-Security limits are fixed in code: 2,000 question characters, one model request, one MCP call, 10-second MCP initialization, 20-second model request, 15-second MCP execution, 45-second overall deadline, 20 records, 64 KiB tool JSON, and 256 maximum model output tokens. Requests use `store: false` and `parallel_tool_calls: false`.
+Security limits are fixed in code: 2,000 question characters, one MCP call, 10-second MCP initialization, a single 20-second model-stage deadline, 15-second MCP execution, 45-second overall deadline, 20 records, 64 KiB tool JSON, and 256 maximum model output tokens per provider attempt. Requests use `store: false`, `parallel_tool_calls: false`, and SDK `maxRetries: 0`.
+
+Phase 5B remains backward compatible: one provider attempt is the default. To allow one retry for the current process, set `MCP_MODEL_MAX_ATTEMPTS` to exactly `2`; only `1` and `2` are accepted. A retry is allowed only for trusted OpenAI SDK HTTP errors with validated status 429, 500, 502, 503, or 504. HTTP 400/401/403/404, other 5xx statuses, ambiguous network failures, request timeouts, cancellation, unknown errors, invalid responses/arguments, and every MCP/SQL failure are never retried. Equal-jitter backoff uses a 500 ms base and a 2,000 ms cap. Before a retry, the selector requires room for both the backoff and at least 1,000 ms for the next attempt; the OpenAI adapter re-enforces that 1,000 ms minimum at its final pre-dispatch boundary. Every adapter call receives only the time remaining within the original model-stage deadline.
 
 ### Test without an OpenAI API key
 
@@ -82,6 +84,8 @@ $env:OPENAI_API_KEY = '<your API key>'
 $env:MCP_SERVER_LAUNCHER_PATH = 'C:\path\outside\the\repository\start-mcp.ps1'
 # Optional; the default is gpt-5.4-mini-2026-03-17:
 $env:OPENAI_MODEL = 'gpt-5.4-mini-2026-03-17'
+# Optional; defaults to 1 (no retry):
+$env:MCP_MODEL_MAX_ATTEMPTS = '2'
 
 npm run agent -- "Show me all pending shipments"
 ```
@@ -91,6 +95,7 @@ After testing:
 ```powershell
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:OPENAI_MODEL -ErrorAction SilentlyContinue
+Remove-Item Env:MCP_MODEL_MAX_ATTEMPTS -ErrorAction SilentlyContinue
 Remove-Item Env:MCP_SERVER_LAUNCHER_PATH -ErrorAction SilentlyContinue
 ```
 
@@ -117,4 +122,4 @@ Sanitized example (timestamps, UUID, durations, and usage vary):
 {"schema_version":1,"timestamp":"2026-10-28T12:00:00.041Z","event":"agent.execution.completed","correlation_id":"11111111-2222-4333-8444-555555555555","outcome":"success","completion_kind":"tool_result","duration_ms":41.2,"tool_execution_count":1}
 ```
 
-The schema contains only fixed event/stage/outcome values, validated token counts, trusted tool names, bounded execution/result counts, durations, and an existing sanitized `AgentFailureCode` on failure. When an OpenAI SDK request fails, the model-selection event also contains one fixed `error_category`: `http_400`, `http_401`, `http_403`, `http_404`, `http_429`, `http_5xx`, `network_failure`, `request_timeout`, or `unknown`. It never contains questions, prompts, tool arguments, model text or raw responses, response IDs, shipment IDs/statuses/rows, SQL statements or diagnostics, API keys, credentials, connection strings, DPAPI material, environment dumps, launcher/filesystem paths, raw errors, exception messages, stack traces, or server stderr. Usage fields are omitted unless all three OpenAI counts are non-negative safe integers; legitimate zero counts are retained. Diagnostics are best-effort: writer or serialization failures do not change agent results or exit behavior.
+The schema contains only fixed event/stage/outcome values, validated token counts, trusted tool names, bounded execution/result counts, durations, and an existing sanitized `AgentFailureCode` on failure. Phase 5B additively retains schema version 1 and adds `agent.model.attempt.completed`, bounded attempt/backoff fields, a fixed retry decision, total attempt count, usage completeness, and a post-response token-budget outcome; existing event names and fields are unchanged. When an OpenAI SDK request fails, the model-selection event also contains one fixed `error_category`: `http_400`, `http_401`, `http_403`, `http_404`, `http_429`, `http_5xx`, `network_failure`, `request_timeout`, or `unknown`. It never contains questions, prompts, tool arguments, model text or raw responses, response IDs, shipment IDs/statuses/rows, SQL statements or diagnostics, API keys, credentials, connection strings, DPAPI material, environment dumps, launcher/filesystem paths, raw errors, exception messages, stack traces, or server stderr. Usage fields are omitted unless all three OpenAI counts are non-negative safe integers; legitimate zero counts are retained. With a retry, reported counts are cumulative known usage only and `usage_completeness` is `incomplete` because a failed provider request may have unreported usage. These controls do not claim exact cost enforcement or billing. Diagnostics are best-effort: writer or serialization failures do not change agent results or exit behavior.

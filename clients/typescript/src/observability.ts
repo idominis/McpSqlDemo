@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { AgentFailureCode } from "./agent.js";
 import type { TrustedToolName } from "./contracts.js";
-import type { ModelUsage } from "./model-router.js";
+import type { ModelAttemptDiagnostic, ModelReliability, ModelUsage } from "./model-router.js";
 import type { OpenAIErrorCategory } from "./openai-model-router.js";
 
 export type OperationalOutcome =
@@ -69,6 +69,7 @@ export class AgentDiagnostics {
     durationMs: number,
     usage: ModelUsage,
     errorCategory?: OpenAIErrorCategory,
+    reliability?: ModelReliability,
   ): void {
     const event: Record<string, string | number> = {
       ...this.base("agent.stage.completed"), stage: "model_selection", outcome, duration_ms: safeDuration(durationMs),
@@ -79,7 +80,26 @@ export class AgentDiagnostics {
       event.total_tokens = usage.totalTokens;
     }
     if (isOpenAIErrorCategory(errorCategory)) event.error_category = errorCategory;
+    if (reliability !== undefined && validReliability(reliability)) {
+      event.total_model_attempt_count = reliability.attemptCount;
+      event.maximum_model_attempts = reliability.maximumAttempts;
+      event.usage_completeness = reliability.usageCompleteness;
+      event.post_response_budget_outcome = reliability.postResponseBudgetOutcome;
+    }
     this.emit(event);
+  }
+
+  public modelAttemptCompleted(diagnostic: ModelAttemptDiagnostic): void {
+    if (!validAttemptDiagnostic(diagnostic)) return;
+    this.emit({
+      ...this.base("agent.model.attempt.completed"),
+      model_attempt: diagnostic.attempt,
+      maximum_model_attempts: diagnostic.maximumAttempts,
+      outcome: diagnostic.outcome,
+      retry_decision: diagnostic.retryDecision,
+      ...(isOpenAIErrorCategory(diagnostic.failureCategory) ? { error_category: diagnostic.failureCategory } : {}),
+      ...(validBackoff(diagnostic.backoffMs) ? { backoff_ms: diagnostic.backoffMs } : {}),
+    });
   }
 
   public toolSelected(toolName: TrustedToolName): void {
@@ -203,4 +223,24 @@ function isOpenAIErrorCategory(value: unknown): value is OpenAIErrorCategory {
     || value === "network_failure"
     || value === "request_timeout"
     || value === "unknown";
+}
+
+function validReliability(value: ModelReliability): boolean {
+  return Number.isInteger(value.attemptCount) && value.attemptCount >= 1 && value.attemptCount <= 2
+    && (value.maximumAttempts === 1 || value.maximumAttempts === 2)
+    && value.attemptCount <= value.maximumAttempts
+    && (value.usageCompleteness === "complete" || value.usageCompleteness === "incomplete")
+    && (value.postResponseBudgetOutcome === "within_limit" || value.postResponseBudgetOutcome === "exceeded" || value.postResponseBudgetOutcome === "unknown");
+}
+
+function validAttemptDiagnostic(value: ModelAttemptDiagnostic): boolean {
+  return Number.isInteger(value.attempt) && value.attempt >= 1 && value.attempt <= 2
+    && (value.maximumAttempts === 1 || value.maximumAttempts === 2)
+    && value.attempt <= value.maximumAttempts
+    && (value.outcome === "success" || value.outcome === "failure")
+    && ["not_needed", "retry", "not_retryable", "attempt_limit", "canceled", "deadline_exhausted"].includes(value.retryDecision);
+}
+
+function validBackoff(value: number | undefined): value is number {
+  return value !== undefined && Number.isInteger(value) && value >= 0 && value <= 2_000;
 }

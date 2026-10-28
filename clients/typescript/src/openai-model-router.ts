@@ -1,6 +1,6 @@
 import OpenAI, { APIConnectionError, APIConnectionTimeoutError, APIError, APIUserAbortError } from "openai";
 import type { FunctionTool } from "openai/resources/responses/responses";
-import type { ModelRouter, ModelRouterResult, ModelSelection, ModelToolCall, ModelToolDefinition, ModelUsage } from "./model-router.js";
+import type { ModelRequestOptions, ModelRouter, ModelRouterResult, ModelSelection, ModelToolCall, ModelToolDefinition, ModelUsage } from "./model-router.js";
 
 export const DEFAULT_OPENAI_MODEL = "gpt-5.4-mini-2026-03-17";
 export const ALLOWED_OPENAI_MODELS = new Set([DEFAULT_OPENAI_MODEL, "gpt-5.4-mini"]);
@@ -20,10 +20,11 @@ export type OpenAIErrorCategory =
 const errorCategories = new WeakMap<Error, OpenAIErrorCategory>();
 
 class OpenAIModelRequestError extends Error {
-  public constructor(category: OpenAIErrorCategory) {
+  public constructor(category: OpenAIErrorCategory, status?: number) {
     super("The OpenAI model request failed.");
     this.name = "OpenAIModelRequestError";
     errorCategories.set(this, category);
+    if (status !== undefined) httpStatuses.set(this, status);
   }
 }
 
@@ -50,25 +51,29 @@ export class OpenAIModelRouter implements ModelRouter {
     question: string,
     tools: readonly ModelToolDefinition[],
     signal: AbortSignal,
+    options?: ModelRequestOptions,
   ): Promise<ModelRouterResult> {
+    const timeout = finalDispatchTimeout(options);
+    const request = {
+      model: this.model,
+      instructions: ROUTER_INSTRUCTIONS,
+      input: [{ role: "user", content: [{ type: "input_text", text: question }] }],
+      tools: toOpenAIFunctionTools(tools),
+      tool_choice: "auto",
+      parallel_tool_calls: false,
+      store: false,
+      max_output_tokens: MAX_MODEL_OUTPUT_TOKENS,
+    };
     let response: unknown;
+    throwIfAborted(signal);
     try {
       response = await this.client.create(
-        {
-          model: this.model,
-          instructions: ROUTER_INSTRUCTIONS,
-          input: [{ role: "user", content: [{ type: "input_text", text: question }] }],
-          tools: toOpenAIFunctionTools(tools),
-          tool_choice: "auto",
-          parallel_tool_calls: false,
-          store: false,
-          max_output_tokens: MAX_MODEL_OUTPUT_TOKENS,
-        },
-        { signal, timeout: 20_000, maxRetries: 0 },
+        request,
+        { signal, timeout, maxRetries: 0 },
       );
     } catch (error: unknown) {
       if (signal.aborted && error instanceof APIUserAbortError) throw error;
-      throw new OpenAIModelRequestError(classifyOpenAIError(error));
+      throw new OpenAIModelRequestError(classifyOpenAIError(error), validatedHttpStatus(error));
     }
     return { selection: parseOpenAIResponse(response), usage: parseOpenAIUsage(response) };
   }
@@ -78,13 +83,22 @@ export function openAIErrorCategory(error: unknown): OpenAIErrorCategory | undef
   return error instanceof Error ? errorCategories.get(error) : undefined;
 }
 
+/** Retry policy uses only trusted SDK types and the SDK's validated numeric status. */
+export function isRetryableOpenAIError(error: unknown): boolean {
+  if (!(error instanceof OpenAIModelRequestError)) return false;
+  const category = errorCategories.get(error);
+  if (category === "http_429") return true;
+  const status = httpStatuses.get(error);
+  return status === 500 || status === 502 || status === 503 || status === 504;
+}
+
 function classifyOpenAIError(error: unknown): OpenAIErrorCategory {
   if (error instanceof APIConnectionTimeoutError) return "request_timeout";
   if (error instanceof APIConnectionError) return "network_failure";
   if (!(error instanceof APIError)) return "unknown";
 
-  const status: unknown = error.status;
-  if (typeof status !== "number" || !Number.isInteger(status) || status < 100 || status > 599) return "unknown";
+  const status = validatedHttpStatus(error);
+  if (status === undefined) return "unknown";
   if (status === 400) return "http_400";
   if (status === 401) return "http_401";
   if (status === 403) return "http_403";
@@ -92,6 +106,39 @@ function classifyOpenAIError(error: unknown): OpenAIErrorCategory {
   if (status === 429) return "http_429";
   if (status >= 500) return "http_5xx";
   return "unknown";
+}
+
+const httpStatuses = new WeakMap<Error, number>();
+
+function validatedHttpStatus(error: unknown): number | undefined {
+  if (!(error instanceof APIError)) return undefined;
+  const status: unknown = error.status;
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+}
+
+function finalDispatchTimeout(options: ModelRequestOptions | undefined): number {
+  const configured = options?.timeoutMs ?? 20_000;
+  if (!Number.isFinite(configured) || configured <= 0) throw new Error("Model request deadline exhausted.");
+  const minimum = options?.minimumDispatchBudgetMs;
+  if (minimum !== undefined && (!Number.isSafeInteger(minimum) || minimum <= 0)) {
+    throw new Error("Model request deadline exhausted.");
+  }
+
+  let available = configured;
+  if (options?.deadlineMs !== undefined) {
+    const now = options.monotonicNow?.() ?? performance.now();
+    if (!Number.isFinite(options.deadlineMs) || !Number.isFinite(now)) throw new Error("Model request deadline exhausted.");
+    available = Math.min(available, options.deadlineMs - now);
+  }
+  const timeout = Math.floor(available);
+  if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("Model request deadline exhausted.");
+  const boundedTimeout = Math.min(20_000, timeout);
+  if (minimum !== undefined && boundedTimeout < minimum) throw new Error("Model request deadline exhausted.");
+  return boundedTimeout;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Model request canceled.");
 }
 
 function toOpenAIFunctionTools(tools: readonly ModelToolDefinition[]): readonly FunctionTool[] {

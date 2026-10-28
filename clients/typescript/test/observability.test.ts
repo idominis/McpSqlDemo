@@ -7,7 +7,8 @@ import type { McpGateway } from "../src/agent-mcp.js";
 import type { DiscoveredTool, TrustedToolName } from "../src/contracts.js";
 import type { ModelRouter, ModelRouterResult, ModelSelection, ModelUsage } from "../src/model-router.js";
 import type { DiagnosticsOptions } from "../src/observability.js";
-import { DEFAULT_OPENAI_MODEL, OpenAIModelRouter } from "../src/openai-model-router.js";
+import { DEFAULT_OPENAI_MODEL, isRetryableOpenAIError, openAIErrorCategory, OpenAIModelRouter } from "../src/openai-model-router.js";
+import { ReliableModelSelector } from "../src/reliable-model-selector.js";
 
 const correlationId = "11111111-2222-4333-8444-555555555555";
 const fixedTimestamp = new Date("2026-10-28T12:00:00.000Z");
@@ -224,6 +225,129 @@ describe("secure agent diagnostics", () => {
     ]);
   });
 
+  it("emits allowlisted retry metadata and marks retry usage incomplete", async () => {
+    const secret = "SECRET-RETRY-MATERIAL";
+    let request = 0;
+    const adapter = new OpenAIModelRouter({ async create() {
+      request += 1;
+      if (request === 1) throw new APIError(503, { secret }, secret, new Headers({ "x-secret": secret }));
+      return { status: "completed", output: [], usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 }, secret };
+    } }, DEFAULT_OPENAI_MODEL);
+    const router = new ReliableModelSelector(adapter, {
+      maximumAttempts: 2, jitter: () => 0, delay: async () => undefined,
+      isRetryable: isRetryableOpenAIError, failureCategory: openAIErrorCategory,
+    });
+    const captured = captureDiagnostics();
+    const result = await runAgentQuestion(
+      "SECRET QUESTION", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options,
+    );
+    assert.equal(result, NO_TOOL_MESSAGE);
+    const attempts = captured.events.filter((event) => event.event === "agent.model.attempt.completed");
+    assert.deepEqual(attempts.map((event) => [event.model_attempt, event.retry_decision, event.error_category, event.backoff_ms]), [
+      [1, "retry", "http_5xx", 250],
+      [2, "not_needed", undefined, undefined],
+    ]);
+    const stage = captured.events.find((event) => event.stage === "model_selection");
+    assert.equal(stage?.total_model_attempt_count, 2);
+    assert.equal(stage?.maximum_model_attempts, 2);
+    assert.equal(stage?.usage_completeness, "incomplete");
+    assert.equal(stage?.post_response_budget_outcome, "within_limit");
+    assert.equal(stage?.input_tokens, 7);
+    assert.equal(stage?.output_tokens, 2);
+    assert.equal(stage?.total_tokens, 9);
+    assertNoSentinels(captured.events, [secret, "SECRET QUESTION", "x-secret"]);
+  });
+
+  it("preserves complete usage metadata when first-attempt local validation fails", async () => {
+    const captured = captureDiagnostics();
+    const router: ModelRouter = { async selectTool() { return {
+      selection: { kind: "unexpected" },
+      usage: { kind: "available", inputTokens: 11, outputTokens: 3, totalTokens: 14 },
+      reliability: {
+        attemptCount: 1, maximumAttempts: 1, usageCompleteness: "complete", postResponseBudgetOutcome: "within_limit",
+      },
+    }; } };
+
+    await assert.rejects(
+      runAgentQuestion("SECRET PROMPT", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options),
+      (error: unknown) => error instanceof AgentError && error.code === "invalid_model_output",
+    );
+    const stage = captured.events.find((event) => event.stage === "model_selection");
+    assert.equal(stage?.outcome, "validation_rejection");
+    assert.equal(stage?.usage_completeness, "complete");
+    assert.equal(stage?.post_response_budget_outcome, "within_limit");
+    assert.deepEqual([stage?.input_tokens, stage?.output_tokens, stage?.total_tokens], [11, 3, 14]);
+    assertNoSentinels(captured.events, ["SECRET PROMPT"]);
+  });
+
+  it("preserves partial retry usage metadata when second-attempt local validation fails", async () => {
+    const captured = captureDiagnostics();
+    const retryable = new Error("SECRET RETRY FAILURE");
+    let calls = 0;
+    const router = new ReliableModelSelector({ async selectTool() {
+      calls += 1;
+      if (calls === 1) throw retryable;
+      return {
+        selection: { kind: "unexpected" },
+        usage: { kind: "available", inputTokens: 13, outputTokens: 4, totalTokens: 17 },
+      };
+    } }, {
+      maximumAttempts: 2, isRetryable: (error) => error === retryable, delay: async () => undefined,
+    });
+
+    await assert.rejects(
+      runAgentQuestion("SECRET PROMPT", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options),
+      (error: unknown) => error instanceof AgentError && error.code === "invalid_model_output",
+    );
+    const stage = captured.events.find((event) => event.stage === "model_selection");
+    assert.equal(stage?.usage_completeness, "incomplete");
+    assert.equal(stage?.post_response_budget_outcome, "within_limit");
+    assert.deepEqual([stage?.input_tokens, stage?.output_tokens, stage?.total_tokens], [13, 4, 17]);
+    assert.equal(calls, 2);
+    assertNoSentinels(captured.events, ["SECRET PROMPT", "SECRET RETRY FAILURE"]);
+  });
+
+  it("reports incomplete unknown usage when both provider attempts fail", async () => {
+    const captured = captureDiagnostics();
+    const failure = new Error("SECRET PROVIDER FAILURE");
+    let calls = 0;
+    const router = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
+      maximumAttempts: 2, isRetryable: (error) => error === failure, delay: async () => undefined,
+    });
+
+    await assert.rejects(
+      runAgentQuestion("SECRET PROMPT", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options),
+      (error: unknown) => error instanceof AgentError && error.code === "model_failed",
+    );
+    const stage = captured.events.find((event) => event.stage === "model_selection");
+    assert.equal(stage?.usage_completeness, "incomplete");
+    assert.equal(stage?.post_response_budget_outcome, "unknown");
+    assert.equal(stage?.total_model_attempt_count, 2);
+    assert.equal("input_tokens" in (stage ?? {}), false);
+    assert.equal(calls, 2);
+    assertNoSentinels(captured.events, ["SECRET PROMPT", "SECRET PROVIDER FAILURE"]);
+  });
+
+  it("classifies absent or invalid successful-response usage as incomplete and unknown", async () => {
+    for (const usage of [undefined, { input_tokens: 1, output_tokens: "invalid", total_tokens: 1 }]) {
+      const captured = captureDiagnostics();
+      const adapter = new OpenAIModelRouter({ async create() {
+        return { status: "completed", output: [{ type: "unexpected_private_shape" }], ...(usage === undefined ? {} : { usage }) };
+      } }, DEFAULT_OPENAI_MODEL);
+      const router = new ReliableModelSelector(adapter);
+
+      await assert.rejects(
+        runAgentQuestion("SECRET PROMPT", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options),
+        (error: unknown) => error instanceof AgentError && error.code === "invalid_model_output",
+      );
+      const stage = captured.events.find((event) => event.stage === "model_selection");
+      assert.equal(stage?.usage_completeness, "incomplete");
+      assert.equal(stage?.post_response_budget_outcome, "unknown");
+      assert.equal("input_tokens" in (stage ?? {}), false);
+      assertNoSentinels(captured.events, ["SECRET PROMPT", "unexpected_private_shape"]);
+    }
+  });
+
   it("does not emit OpenAI failure diagnostics when diagnostics are disabled", async () => {
     const lines: string[] = [];
     const router = new OpenAIModelRouter({
@@ -275,8 +399,21 @@ describe("secure agent diagnostics", () => {
         && error.code === "model_failed"
         && error.message === "The model request failed.",
     );
+    let retryCalls = 0;
+    const retryFailure = new Error("private retry failure");
+    const retrying = new ReliableModelSelector({ async selectTool() {
+      retryCalls += 1;
+      if (retryCalls === 1) throw retryFailure;
+      return { selection: { kind: "none" }, usage: { kind: "unavailable" } };
+    } }, { maximumAttempts: 2, isRetryable: (error) => error === retryFailure, delay: async () => undefined });
+    const retryResult = await runAgentQuestion(
+      "hello", retrying, new FakeGateway(jsonResult([])), new AbortController().signal,
+      undefined, { ...base, writer: () => { throw new Error("writer failure"); } },
+    );
     assert.equal(throwingWriter, NO_TOOL_MESSAGE);
     assert.equal(throwingSerializer, NO_TOOL_MESSAGE);
+    assert.equal(retryResult, NO_TOOL_MESSAGE);
+    assert.equal(retryCalls, 2);
   });
 });
 
