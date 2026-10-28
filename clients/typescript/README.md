@@ -64,6 +64,7 @@ From `clients/typescript`:
 ```powershell
 Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:MCP_SERVER_LAUNCHER_PATH -ErrorAction SilentlyContinue
+$env:MCP_AGENT_DIAGNOSTICS = '0'
 npm ci --ignore-scripts
 npm run typecheck
 npm run build
@@ -94,3 +95,26 @@ Remove-Item Env:MCP_SERVER_LAUNCHER_PATH -ErrorAction SilentlyContinue
 ```
 
 The agent intentionally reports sanitized failures. It never sends launcher paths, environment dumps, SQL credentials, DPAPI material, stack traces, raw MCP errors, or MCP tool results to OpenAI.
+
+## Secure local diagnostics (Phase 5A)
+
+Agent diagnostics are disabled by default. Enable them only for the current process by setting `MCP_AGENT_DIAGNOSTICS` to exactly `1`:
+
+```powershell
+$env:MCP_AGENT_DIAGNOSTICS = '1'
+npm run agent -- "Show me all pending shipments"
+Remove-Item Env:MCP_AGENT_DIAGNOSTICS -ErrorAction SilentlyContinue
+```
+
+Missing values, `0`, and every value other than `1` keep diagnostics disabled. Events are dependency-free JSON Lines written only to stderr; the formatted shipment response remains on stdout. Each execution gets one locally generated UUID correlation ID. Durations use a monotonic clock and include bounded MCP gateway shutdown in the final execution duration.
+
+Sanitized example (timestamps, UUID, durations, and usage vary):
+
+```jsonl
+{"schema_version":1,"timestamp":"2026-10-28T12:00:00.000Z","event":"agent.execution.started","correlation_id":"11111111-2222-4333-8444-555555555555"}
+{"schema_version":1,"timestamp":"2026-10-28T12:00:00.018Z","event":"agent.stage.completed","correlation_id":"11111111-2222-4333-8444-555555555555","stage":"model_selection","outcome":"success","duration_ms":12.4,"input_tokens":84,"output_tokens":9,"total_tokens":93}
+{"schema_version":1,"timestamp":"2026-10-28T12:00:00.019Z","event":"agent.tool.selected","correlation_id":"11111111-2222-4333-8444-555555555555","tool_name":"get_shipments_by_status"}
+{"schema_version":1,"timestamp":"2026-10-28T12:00:00.041Z","event":"agent.execution.completed","correlation_id":"11111111-2222-4333-8444-555555555555","outcome":"success","completion_kind":"tool_result","duration_ms":41.2,"tool_execution_count":1}
+```
+
+The schema contains only fixed event/stage/outcome values, validated token counts, trusted tool names, bounded execution/result counts, durations, and an existing sanitized `AgentFailureCode` on failure. When an OpenAI SDK request fails, the model-selection event also contains one fixed `error_category`: `http_400`, `http_401`, `http_403`, `http_404`, `http_429`, `http_5xx`, `network_failure`, `request_timeout`, or `unknown`. It never contains questions, prompts, tool arguments, model text or raw responses, response IDs, shipment IDs/statuses/rows, SQL statements or diagnostics, API keys, credentials, connection strings, DPAPI material, environment dumps, launcher/filesystem paths, raw errors, exception messages, stack traces, or server stderr. Usage fields are omitted unless all three OpenAI counts are non-negative safe integers; legitimate zero counts are retained. Diagnostics are best-effort: writer or serialization failures do not change agent results or exit behavior.

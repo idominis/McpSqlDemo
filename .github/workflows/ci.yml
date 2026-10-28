@@ -24,6 +24,7 @@ jobs:
       MCP_SQL_RUN_STDIO_INTEGRATION: "0"
       OPENAI_API_KEY: ""
       MCP_SERVER_LAUNCHER_PATH: ""
+      MCP_AGENT_DIAGNOSTICS: "0"
 
     steps:
       - name: Check out repository

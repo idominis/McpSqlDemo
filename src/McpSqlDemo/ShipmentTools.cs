@@ -16,13 +16,11 @@ public static class ShipmentTools
         CancellationToken cancellationToken)
     {
         var logger = loggerFactory.CreateLogger("ShipmentTools");
-        logger.LogInformation("Tool call started for {ToolName} with shipment ID {ShipmentId}",
-            nameof(GetShipmentById), shipmentId);
+        LogStarted(logger, nameof(GetShipmentById));
 
         if (!ShipmentInputValidation.IsValidShipmentId(shipmentId))
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType}",
-                nameof(GetShipmentById), "InvalidInput");
+            LogFailure(logger, nameof(GetShipmentById), "InvalidInput");
             throw new McpException("shipmentId must be between 1 and 1,000,000.");
         }
 
@@ -34,41 +32,37 @@ public static class ShipmentTools
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            logger.LogInformation("Tool call canceled for {ToolName}", nameof(GetShipmentById));
+            LogCanceled(logger, nameof(GetShipmentById));
             throw;
         }
         catch (ShipmentToolDeadlineExceededException)
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType}",
-                nameof(GetShipmentById), "DeadlineExceeded");
+            LogFailure(logger, nameof(GetShipmentById), "DeadlineExceeded");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
         catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
         {
-            LogDatabaseFailure(logger, nameof(GetShipmentById), exception, "DatabaseTimeout");
+            LogFailure(logger, nameof(GetShipmentById), "DatabaseTimeout");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (ShipmentDatabaseException exception)
+        catch (ShipmentDatabaseException)
         {
-            LogDatabaseFailure(logger, nameof(GetShipmentById), exception);
+            LogFailure(logger, nameof(GetShipmentById), "DatabaseFailure");
             throw new McpException("The shipment database operation failed. Please try again later.");
         }
-        catch (Exception exception)
+        catch (Exception)
         {
-            LogUnexpectedFailure(logger, nameof(GetShipmentById), exception);
+            LogFailure(logger, nameof(GetShipmentById), "UnexpectedFailure");
             throw new McpException("The shipment operation failed. Please try again later.");
         }
 
-        logger.LogInformation("Tool call completed for {ToolName}; shipment found: {ShipmentFound}",
-            nameof(GetShipmentById), shipment is not null);
-
         if (shipment is null)
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType} and shipment ID {ShipmentId}",
-                nameof(GetShipmentById), "NotFound", shipmentId);
+            LogFailure(logger, nameof(GetShipmentById), "NotFound");
             throw new McpException($"Shipment with ID {shipmentId} was not found.");
         }
 
+        LogCompleted(logger, nameof(GetShipmentById));
         return shipment;
     }
 
@@ -81,39 +75,37 @@ public static class ShipmentTools
         CancellationToken cancellationToken)
     {
         var logger = loggerFactory.CreateLogger("ShipmentTools");
-        logger.LogInformation("Tool call started for {ToolName}", nameof(ListShipments));
+        LogStarted(logger, nameof(ListShipments));
 
         try
         {
             var shipments = await executionPolicy.ExecuteAsync(repository.ListAsync, cancellationToken);
-            logger.LogInformation("Tool call completed for {ToolName} with {ResultCount} results",
-                nameof(ListShipments), shipments.Count);
+            LogCompleted(logger, nameof(ListShipments));
             return shipments;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            logger.LogInformation("Tool call canceled for {ToolName}", nameof(ListShipments));
+            LogCanceled(logger, nameof(ListShipments));
             throw;
         }
         catch (ShipmentToolDeadlineExceededException)
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType}",
-                nameof(ListShipments), "DeadlineExceeded");
+            LogFailure(logger, nameof(ListShipments), "DeadlineExceeded");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
         catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
         {
-            LogDatabaseFailure(logger, nameof(ListShipments), exception, "DatabaseTimeout");
+            LogFailure(logger, nameof(ListShipments), "DatabaseTimeout");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (ShipmentDatabaseException exception)
+        catch (ShipmentDatabaseException)
         {
-            LogDatabaseFailure(logger, nameof(ListShipments), exception);
+            LogFailure(logger, nameof(ListShipments), "DatabaseFailure");
             throw new McpException("The shipment database operation failed. Please try again later.");
         }
-        catch (Exception exception)
+        catch (Exception)
         {
-            LogUnexpectedFailure(logger, nameof(ListShipments), exception);
+            LogFailure(logger, nameof(ListShipments), "UnexpectedFailure");
             throw new McpException("The shipment operation failed. Please try again later.");
         }
     }
@@ -133,69 +125,57 @@ public static class ShipmentTools
 
         if (canonicalStatus is null)
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType}",
-                nameof(GetShipmentsByStatus), "InvalidInput");
+            LogFailure(logger, nameof(GetShipmentsByStatus), "InvalidInput");
             throw new McpException("status must be one of: Pending, Loading, Completed.");
         }
 
-        logger.LogInformation("Tool call started for {ToolName} with canonical status {ShipmentStatus}",
-            nameof(GetShipmentsByStatus), canonicalStatus);
+        LogStarted(logger, nameof(GetShipmentsByStatus));
 
         try
         {
             var shipments = await executionPolicy.ExecuteAsync(
                 ct => repository.GetByStatusAsync(canonicalStatus, ct), cancellationToken);
-            logger.LogInformation(
-                "Tool call completed for {ToolName} with canonical status {ShipmentStatus} and {ResultCount} results",
-                nameof(GetShipmentsByStatus), canonicalStatus, shipments.Count);
+            LogCompleted(logger, nameof(GetShipmentsByStatus));
             return shipments;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            logger.LogInformation("Tool call canceled for {ToolName}", nameof(GetShipmentsByStatus));
+            LogCanceled(logger, nameof(GetShipmentsByStatus));
             throw;
         }
         catch (ShipmentToolDeadlineExceededException)
         {
-            logger.LogWarning("Tool call failed for {ToolName} with failure type {FailureType} and canonical status {ShipmentStatus}",
-                nameof(GetShipmentsByStatus), "DeadlineExceeded", canonicalStatus);
+            LogFailure(logger, nameof(GetShipmentsByStatus), "DeadlineExceeded");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
         catch (ShipmentDatabaseException exception) when (exception.IsCommandTimeout)
         {
-            LogDatabaseFailure(
-                logger, nameof(GetShipmentsByStatus), exception, "DatabaseTimeout", canonicalStatus);
+            LogFailure(logger, nameof(GetShipmentsByStatus), "DatabaseTimeout");
             throw new McpException("The shipment operation timed out. Please try again later.");
         }
-        catch (ShipmentDatabaseException exception)
+        catch (ShipmentDatabaseException)
         {
-            LogDatabaseFailure(
-                logger, nameof(GetShipmentsByStatus), exception, canonicalStatus: canonicalStatus);
+            LogFailure(logger, nameof(GetShipmentsByStatus), "DatabaseFailure");
             throw new McpException("The shipment database operation failed. Please try again later.");
         }
-        catch (Exception exception)
+        catch (Exception)
         {
-            LogUnexpectedFailure(logger, nameof(GetShipmentsByStatus), exception, canonicalStatus);
+            LogFailure(logger, nameof(GetShipmentsByStatus), "UnexpectedFailure");
             throw new McpException("The shipment operation failed. Please try again later.");
         }
     }
 
-    private static void LogDatabaseFailure(
-        ILogger logger,
-        string toolName,
-        ShipmentDatabaseException exception,
-        string failureType = "DatabaseFailure",
-        string? canonicalStatus = null) =>
-        logger.LogError(
-            "Tool call failed for {ToolName} with failure type {FailureType}, SQL number {SqlNumber}, state {SqlState}, class {SqlClass}, and canonical status {ShipmentStatus}",
-            toolName, failureType, exception.Number, exception.State, exception.Class, canonicalStatus);
+    private static void LogStarted(ILogger logger, string toolName) =>
+        logger.LogInformation("Shipment tool event {ToolEvent} for {ToolName}", "Started", toolName);
 
-    private static void LogUnexpectedFailure(
-        ILogger logger,
-        string toolName,
-        Exception exception,
-        string? canonicalStatus = null) =>
-        logger.LogError(
-            "Tool call failed for {ToolName} with failure type {FailureType}, exception type {ExceptionType}, HRESULT {ExceptionHResult}, and canonical status {ShipmentStatus}",
-            toolName, "UnexpectedFailure", exception.GetType().FullName, exception.HResult, canonicalStatus);
+    private static void LogCompleted(ILogger logger, string toolName) =>
+        logger.LogInformation("Shipment tool event {ToolEvent} for {ToolName}", "Completed", toolName);
+
+    private static void LogCanceled(ILogger logger, string toolName) =>
+        logger.LogInformation("Shipment tool event {ToolEvent} for {ToolName}", "Canceled", toolName);
+
+    private static void LogFailure(ILogger logger, string toolName, string failureCategory) =>
+        logger.LogWarning(
+            "Shipment tool event {ToolEvent} for {ToolName} with category {FailureCategory}",
+            "Failed", toolName, failureCategory);
 }

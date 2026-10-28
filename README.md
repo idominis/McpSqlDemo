@@ -139,6 +139,10 @@ npm run agent -- "Show me all pending shipments"
 
 The model performs intent recognition and selects at most one locally defined function. The client independently validates the discovered MCP allowlist, schemas, selected tool and arguments, and bounded shipment result; SQL-derived results are formatted locally and never sent back to the model. Tests use a deterministic mock and require no API key, SQL Server, launcher, DPAPI material, or network. Configuration and exact local test commands—with and without a real API key—are documented in [the TypeScript client README](clients/typescript/README.md#secure-ai-tool-selection-phase-4b).
 
+### Secure agent diagnostics (Phase 5A)
+
+Set `MCP_AGENT_DIAGNOSTICS=1` to emit sanitized JSONL events to stderr; diagnostics are otherwise disabled and shipment output remains on stdout. One locally generated correlation ID connects initialization, model selection, optional MCP execution, validation/formatting, and completion events. Questions, prompts, arguments, model/MCP payloads, shipment or SQL data, secrets, raw failures, and sensitive paths are excluded by construction. See [Secure local diagnostics](clients/typescript/README.md#secure-local-diagnostics-phase-5a) for examples, privacy boundaries, and API-key-free verification.
+
 ## Continuous integration
 
 GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. It also installs Node.js LTS and runs `npm ci`, typechecking, build, and isolated unit tests for the TypeScript client. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection, no launcher path, and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets and never starts the real launcher.

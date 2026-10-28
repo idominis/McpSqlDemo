@@ -244,7 +244,7 @@ public sealed class ShipmentToolsTests
     }
 
     [Fact]
-    public async Task ListShipments_WhenSqlCommandTimesOut_ReturnsSafeTimeoutErrorAndLogsNumericDiagnostics()
+    public async Task ListShipments_WhenSqlCommandTimesOut_ReturnsSafeTimeoutErrorWithoutSqlDiagnostics()
     {
         const string sensitiveDetail =
             "Server=private-host;Password=do-not-leak; command timeout stack trace";
@@ -271,12 +271,12 @@ public sealed class ShipmentToolsTests
             message.Contains(sensitiveDetail, StringComparison.OrdinalIgnoreCase) ||
             message.Contains("Password", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(messages, message =>
-            message.Contains("DatabaseTimeout", StringComparison.Ordinal) &&
-            message.Contains("-2", StringComparison.Ordinal));
+            message.Contains("DatabaseTimeout", StringComparison.Ordinal));
+        Assert.DoesNotContain(messages, message => message.Contains("-2", StringComparison.Ordinal));
     }
 
     [Fact]
-    public async Task ListShipments_WhenDatabaseFails_ReturnsSafeDatabaseErrorAndLogsNumericDiagnostics()
+    public async Task ListShipments_WhenDatabaseFails_ReturnsSafeDatabaseErrorWithoutSqlDiagnostics()
     {
         const string sensitiveDetail =
             "Server=private-host;Password=do-not-leak; login failure stack trace";
@@ -303,8 +303,49 @@ public sealed class ShipmentToolsTests
             message.Contains(sensitiveDetail, StringComparison.OrdinalIgnoreCase) ||
             message.Contains("Password", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(messages, message =>
-            message.Contains("DatabaseFailure", StringComparison.Ordinal) &&
-            message.Contains("18456", StringComparison.Ordinal));
+            message.Contains("DatabaseFailure", StringComparison.Ordinal));
+        Assert.DoesNotContain(messages, message => message.Contains("18456", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ApplicationLogs_NeverContainShipmentDataOrSensitiveFailureSentinels()
+    {
+        const int shipmentId = 987654;
+        const string reference = "SENSITIVE-ROW-REFERENCE";
+        const string status = "Pending";
+        const string exceptionDetail =
+            "RAW-EXCEPTION-SENTINEL Server=secret-host;Password=secret; C:\\private\\launcher.ps1 HRESULT=80004005";
+        var messages = new List<string>();
+        using var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(
+            builder => builder.AddProvider(new RecordingLoggerProvider(messages)));
+        using var executionPolicy = CreateExecutionPolicy();
+
+        var byIdRepository = new FakeShipmentRepository
+        {
+            ShipmentById = new Shipment(shipmentId, reference, status, 17.25m)
+        };
+        await ShipmentTools.GetShipmentById(
+            byIdRepository, executionPolicy, loggerFactory, shipmentId, CancellationToken.None);
+
+        var byStatusRepository = new FakeShipmentRepository { ShipmentsByStatus = [] };
+        await ShipmentTools.GetShipmentsByStatus(
+            byStatusRepository, executionPolicy, loggerFactory, status, CancellationToken.None);
+
+        var failingRepository = new FakeShipmentRepository
+        {
+            ListHandler = _ => throw new InvalidOperationException(exceptionDetail)
+        };
+        await Assert.ThrowsAsync<McpException>(() => ShipmentTools.ListShipments(
+            failingRepository, executionPolicy, loggerFactory, CancellationToken.None));
+
+        var rendered = string.Join("\n", messages);
+        Assert.DoesNotContain(shipmentId.ToString(), rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(reference, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(status, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain(exceptionDetail, rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("Password", rendered, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("HRESULT", rendered, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("C:\\private", rendered, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

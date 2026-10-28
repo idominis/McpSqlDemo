@@ -8,7 +8,9 @@ import {
   type ShipmentStatus,
   type TrustedToolName,
 } from "./contracts.js";
-import type { ModelRouter, ModelSelection } from "./model-router.js";
+import type { ModelRouter, ModelSelection, ModelUsage } from "./model-router.js";
+import { AgentDiagnostics, type CompletionKind, type DiagnosticsOptions, type OperationalOutcome } from "./observability.js";
+import { openAIErrorCategory, type OpenAIErrorCategory } from "./openai-model-router.js";
 import { MAX_TOOL_RESULT_BYTES, readJsonToolResult } from "./response.js";
 
 export const MAX_QUESTION_CHARACTERS = 2_000;
@@ -69,20 +71,50 @@ export async function runAgentQuestion(
   gateway: McpGateway,
   callerSignal: AbortSignal,
   limits: AgentLimits = DEFAULT_AGENT_LIMITS,
+  diagnosticsOptions: DiagnosticsOptions = {},
 ): Promise<string> {
-  validateQuestion(question);
-  const overall = linkedTimeout(callerSignal, limits.overallMs);
+  const diagnostics = new AgentDiagnostics(diagnosticsOptions);
+  const executionStart = diagnostics.monotonicNow();
+  diagnostics.executionStarted();
 
   try {
-    return await raceWithAbort(
-      runAgentCore(question, router, gateway, overall.signal, callerSignal, limits),
+    validateQuestion(question);
+  } catch (error: unknown) {
+    diagnostics.executionCompleted(
+      outcomeForError(error), "failure", diagnostics.durationSince(executionStart), 0,
+      error instanceof AgentError ? error.code : undefined,
+    );
+    throw error;
+  }
+
+  const overall = linkedTimeout(callerSignal, limits.overallMs);
+  const execution = { toolCount: 0 as 0 | 1, completionKind: "failure" as CompletionKind };
+  let failure: unknown;
+
+  try {
+    const result = await raceWithAbort(
+      runAgentCore(question, router, gateway, overall.signal, callerSignal, limits, diagnostics, execution),
       overall.signal,
       "overall_timeout",
       callerSignal,
     );
+    execution.completionKind = result.completionKind;
+    return result.output;
+  } catch (error: unknown) {
+    failure = error;
+    execution.completionKind = "failure";
+    throw error;
   } finally {
     overall.dispose();
     await closeWithTimeout(gateway, limits.shutdownMs);
+    const activeError = failure instanceof AgentError ? failure : undefined;
+    diagnostics.executionCompleted(
+      failure === undefined ? "success" : outcomeForError(failure),
+      execution.completionKind,
+      diagnostics.durationSince(executionStart),
+      execution.toolCount,
+      activeError?.code,
+    );
   }
 }
 
@@ -93,32 +125,80 @@ async function runAgentCore(
   overallSignal: AbortSignal,
   callerSignal: AbortSignal,
   limits: AgentLimits,
-): Promise<string> {
-  const discovered = await runStage(
-    (signal) => gateway.initializeAndDiscover(signal), overallSignal, limits.initializationMs,
-    "initialization_timeout", "initialization_failed", callerSignal,
-  );
+  diagnostics: AgentDiagnostics,
+  execution: { toolCount: 0 | 1 },
+): Promise<{ readonly output: string; readonly completionKind: CompletionKind }> {
+  const initializationStart = diagnostics.monotonicNow();
   try {
+    const discovered = await runStage(
+      (signal) => gateway.initializeAndDiscover(signal), overallSignal, limits.initializationMs,
+      "initialization_timeout", "initialization_failed", callerSignal,
+    );
     validateDiscoveredTools(discovered);
-  } catch {
-    throw new AgentError("initialization_failed");
+    diagnostics.initializationCompleted("success", diagnostics.durationSince(initializationStart));
+  } catch (error: unknown) {
+    const normalized = error instanceof AgentError ? error : new AgentError("initialization_failed");
+    diagnostics.initializationCompleted(outcomeForError(normalized), diagnostics.durationSince(initializationStart));
+    throw normalized;
   }
 
-  const selection = await runStage(
-    (signal) => router.selectTool(question, TRUSTED_MODEL_TOOLS, signal), overallSignal, limits.modelMs,
-    "model_timeout", "model_failed", callerSignal,
-  );
-  if (selection.kind === "none") return NO_TOOL_MESSAGE;
-  const call = validateSelection(selection);
-
-  const result = await runStage(
-    (signal) => gateway.callTool(call.name, call.arguments, signal), overallSignal, limits.toolMs,
-    "tool_timeout", "tool_failed", callerSignal,
-  );
+  const modelStart = diagnostics.monotonicNow();
+  let usage: ModelUsage = { kind: "unavailable" };
+  let errorCategory: OpenAIErrorCategory | undefined;
+  let call: ValidatedCall | undefined;
   try {
-    return formatToolResult(call.name, result);
-  } catch {
-    throw new AgentError("invalid_tool_result");
+    const modelResult = await runStage(
+      async (signal) => {
+        try {
+          return await router.selectTool(question, TRUSTED_MODEL_TOOLS, signal);
+        } catch (error: unknown) {
+          errorCategory = openAIErrorCategory(error);
+          throw error;
+        }
+      }, overallSignal, limits.modelMs,
+      "model_timeout", "model_failed", callerSignal,
+    );
+    usage = modelResult.usage;
+    const selection = modelResult.selection;
+    if (selection.kind !== "none") call = validateSelection(selection);
+    diagnostics.modelSelectionCompleted("success", diagnostics.durationSince(modelStart), usage);
+  } catch (error: unknown) {
+    diagnostics.modelSelectionCompleted(outcomeForError(error), diagnostics.durationSince(modelStart), usage, errorCategory);
+    throw error;
+  }
+
+  if (call === undefined) {
+    const mcpStart = diagnostics.monotonicNow();
+    diagnostics.mcpExecutionCompleted("success", diagnostics.durationSince(mcpStart), 0);
+    const formattingStart = diagnostics.monotonicNow();
+    diagnostics.validationFormattingCompleted("success", diagnostics.durationSince(formattingStart));
+    return { output: NO_TOOL_MESSAGE, completionKind: "no_tool" };
+  }
+  diagnostics.toolSelected(call.name);
+
+  const mcpStart = diagnostics.monotonicNow();
+  execution.toolCount = 1;
+  let result: CallToolResult;
+  try {
+    result = await runStage(
+      (signal) => gateway.callTool(call.name, call.arguments, signal), overallSignal, limits.toolMs,
+      "tool_timeout", "tool_failed", callerSignal,
+    );
+    diagnostics.mcpExecutionCompleted("success", diagnostics.durationSince(mcpStart), 1, call.name);
+  } catch (error: unknown) {
+    diagnostics.mcpExecutionCompleted(outcomeForError(error), diagnostics.durationSince(mcpStart), 1, call.name);
+    throw error;
+  }
+
+  const formattingStart = diagnostics.monotonicNow();
+  try {
+    const formatted = formatToolResult(call.name, result);
+    diagnostics.validationFormattingCompleted("success", diagnostics.durationSince(formattingStart), formatted.resultCount);
+    return { output: formatted.output, completionKind: "tool_result" };
+  } catch (error: unknown) {
+    const normalized = error instanceof AgentError ? error : new AgentError("invalid_tool_result");
+    diagnostics.validationFormattingCompleted(outcomeForError(normalized), diagnostics.durationSince(formattingStart));
+    throw normalized;
   }
 }
 
@@ -156,15 +236,15 @@ function validateSelection(selection: Exclude<ModelSelection, { kind: "none" }>)
   return { name: call.name, arguments: { status: parsed.status } };
 }
 
-function formatToolResult(toolName: TrustedToolName, result: CallToolResult): string {
+function formatToolResult(toolName: TrustedToolName, result: CallToolResult): { output: string; resultCount: number } {
   const value = readJsonToolResult(result, MAX_TOOL_RESULT_BYTES);
   const records = toolName === "get_shipment_by_id" ? [validateShipment(value)] : validateShipmentArray(value);
-  if (records.length === 0) return "No shipments found.";
+  if (records.length === 0) return { output: "No shipments found.", resultCount: 0 };
   const lines = ["ID\tReference\tStatus\tQuantity"];
   for (const shipment of records) {
     lines.push(`${shipment.id}\t${shipment.reference}\t${shipment.status}\t${shipment.quantity.toFixed(2)}`);
   }
-  return lines.join("\n");
+  return { output: lines.join("\n"), resultCount: records.length };
 }
 
 function validateShipmentArray(value: unknown): readonly Shipment[] {
@@ -259,6 +339,27 @@ async function closeWithTimeout(gateway: McpGateway, timeoutMs: number): Promise
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function outcomeForError(error: unknown): OperationalOutcome {
+  if (!(error instanceof AgentError)) return "external_failure";
+  switch (error.code) {
+    case "invalid_question":
+    case "invalid_model_output":
+    case "invalid_tool_result":
+      return "validation_rejection";
+    case "initialization_timeout":
+    case "model_timeout":
+    case "tool_timeout":
+    case "overall_timeout":
+      return "timeout";
+    case "canceled":
+      return "cancellation";
+    case "initialization_failed":
+    case "model_failed":
+    case "tool_failed":
+      return "external_failure";
   }
 }
 
