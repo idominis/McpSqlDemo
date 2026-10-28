@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { APIConnectionError, APIConnectionTimeoutError, APIError } from "openai";
 import { TRUSTED_MODEL_TOOLS } from "../src/contracts.js";
+import { isRetryableModelFailure, modelFailureCategory } from "../src/model-router.js";
 import {
   DEFAULT_OPENAI_MODEL,
+  isRetryableOpenAIError,
   MAX_MODEL_OUTPUT_TOKENS,
   OpenAIModelRouter,
-  isRetryableOpenAIError,
   openAIErrorCategory,
   parseOpenAIResponse,
   parseOpenAIUsage,
@@ -181,6 +182,30 @@ describe("OpenAI Responses model router", () => {
 
     for (const failure of malformed) assert.equal(await categoryFromFailedRequest(failure), "unknown");
   });
+
+  it("preserves the deprecated OpenAI error compatibility aliases", async () => {
+    for (const status of [429, 500, 502, 503, 504]) {
+      const failure = await wrappedFailure(new APIError(status, {}, "private", new Headers()));
+      assert.equal(openAIErrorCategory(failure), status === 429 ? "http_429" : "http_5xx");
+      assert.equal(isRetryableOpenAIError(failure), true);
+    }
+
+    for (const status of [409, 501, 505, 599]) {
+      const failure = await wrappedFailure(new APIError(status, {}, "private", new Headers()));
+      assert.equal(openAIErrorCategory(failure), status >= 500 ? "http_5xx" : "unknown");
+      assert.equal(isRetryableOpenAIError(failure), false);
+    }
+
+    const malformed = await wrappedFailure(new APIError("503" as never, {}, "private", new Headers()));
+    assert.equal(openAIErrorCategory(malformed), "unknown");
+    assert.equal(isRetryableOpenAIError(malformed), false);
+
+    const unknown = await wrappedFailure(new Error("503"));
+    assert.equal(openAIErrorCategory(unknown), "unknown");
+    assert.equal(isRetryableOpenAIError(unknown), false);
+    assert.equal(openAIErrorCategory({ category: "http_429", retryable: true }), undefined);
+    assert.equal(isRetryableOpenAIError({ category: "http_429", retryable: true }), false);
+  });
 });
 
 async function categoryFromFailedRequest(failure: unknown): Promise<string | undefined> {
@@ -188,7 +213,7 @@ async function categoryFromFailedRequest(failure: unknown): Promise<string | und
   try {
     await router.selectTool("offline test", TRUSTED_MODEL_TOOLS, new AbortController().signal);
   } catch (error: unknown) {
-    return openAIErrorCategory(error);
+    return modelFailureCategory(error);
   }
   assert.fail("Expected the offline client to reject.");
 }
@@ -198,7 +223,17 @@ async function retryableFromFailedRequest(failure: unknown): Promise<boolean> {
   try {
     await router.selectTool("offline test", TRUSTED_MODEL_TOOLS, new AbortController().signal);
   } catch (error: unknown) {
-    return isRetryableOpenAIError(error);
+    return isRetryableModelFailure(error);
+  }
+  assert.fail("Expected the offline client to reject.");
+}
+
+async function wrappedFailure(failure: unknown): Promise<unknown> {
+  const router = new OpenAIModelRouter({ async create() { throw failure; } }, DEFAULT_OPENAI_MODEL);
+  try {
+    await router.selectTool("offline test", TRUSTED_MODEL_TOOLS, new AbortController().signal);
+  } catch (error: unknown) {
+    return error;
   }
   assert.fail("Expected the offline client to reject.");
 }

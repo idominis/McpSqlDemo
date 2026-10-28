@@ -2,8 +2,13 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import type { AgentFailureCode } from "./agent.js";
 import type { TrustedToolName } from "./contracts.js";
-import type { ModelAttemptDiagnostic, ModelReliability, ModelUsage } from "./model-router.js";
-import type { OpenAIErrorCategory } from "./openai-model-router.js";
+import {
+  isModelFailureCategory,
+  type ModelAttemptDiagnostic,
+  type ModelFailureCategory,
+  type ModelReliability,
+  type ModelUsage,
+} from "./model-router.js";
 
 export type OperationalOutcome =
   | "success"
@@ -68,7 +73,7 @@ export class AgentDiagnostics {
     outcome: OperationalOutcome,
     durationMs: number,
     usage: ModelUsage,
-    errorCategory?: OpenAIErrorCategory,
+    errorCategory?: ModelFailureCategory,
     reliability?: ModelReliability,
   ): void {
     const event: Record<string, string | number> = {
@@ -79,7 +84,7 @@ export class AgentDiagnostics {
       event.output_tokens = usage.outputTokens;
       event.total_tokens = usage.totalTokens;
     }
-    if (isOpenAIErrorCategory(errorCategory)) event.error_category = errorCategory;
+    if (isModelFailureCategory(errorCategory)) event.error_category = errorCategory;
     if (reliability !== undefined && validReliability(reliability)) {
       event.total_model_attempt_count = reliability.attemptCount;
       event.maximum_model_attempts = reliability.maximumAttempts;
@@ -97,7 +102,7 @@ export class AgentDiagnostics {
       maximum_model_attempts: diagnostic.maximumAttempts,
       outcome: diagnostic.outcome,
       retry_decision: diagnostic.retryDecision,
-      ...(isOpenAIErrorCategory(diagnostic.failureCategory) ? { error_category: diagnostic.failureCategory } : {}),
+      ...(isModelFailureCategory(diagnostic.failureCategory) ? { error_category: diagnostic.failureCategory } : {}),
       ...(validBackoff(diagnostic.backoffMs) ? { backoff_ms: diagnostic.backoffMs } : {}),
     });
   }
@@ -211,18 +216,6 @@ function isResultCount(value: number | undefined): value is number {
 function validUsage(usage: Extract<ModelUsage, { kind: "available" }>): boolean {
   return [usage.inputTokens, usage.outputTokens, usage.totalTokens]
     .every((value) => Number.isSafeInteger(value) && value >= 0);
-}
-
-function isOpenAIErrorCategory(value: unknown): value is OpenAIErrorCategory {
-  return value === "http_400"
-    || value === "http_401"
-    || value === "http_403"
-    || value === "http_404"
-    || value === "http_429"
-    || value === "http_5xx"
-    || value === "network_failure"
-    || value === "request_timeout"
-    || value === "unknown";
 }
 
 function validReliability(value: ModelReliability): boolean {

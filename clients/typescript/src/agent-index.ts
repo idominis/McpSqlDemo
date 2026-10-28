@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { AgentError, runAgentQuestion } from "./agent.js";
 import { createConfiguredMcpGateway } from "./agent-mcp.js";
-import { createOpenAIModelRouter, isRetryableOpenAIError, MAX_MODEL_OUTPUT_TOKENS, openAIErrorCategory } from "./openai-model-router.js";
+import { createOpenAIModelRouter, MAX_MODEL_OUTPUT_TOKENS } from "./openai-model-router.js";
 import { modelMaximumAttempts, ReliableModelSelector } from "./reliable-model-selector.js";
 
 const abortController = new AbortController();
@@ -14,8 +14,6 @@ try {
   if (argumentsValue.length !== 1) throw new AgentError("invalid_question");
   const router = new ReliableModelSelector(createOpenAIModelRouter(), {
     maximumAttempts: modelMaximumAttempts(),
-    isRetryable: isRetryableOpenAIError,
-    failureCategory: openAIErrorCategory,
     outputTokenLimit: MAX_MODEL_OUTPUT_TOKENS,
   });
   const gateway = await createConfiguredMcpGateway();

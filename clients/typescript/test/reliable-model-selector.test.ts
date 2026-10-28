@@ -5,10 +5,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AgentError, runAgentQuestion, type AgentLimits } from "../src/agent.js";
 import type { McpGateway } from "../src/agent-mcp.js";
 import type { DiscoveredTool, TrustedToolName } from "../src/contracts.js";
-import type { ModelAttemptDiagnostic, ModelRouter, ModelRouterResult } from "../src/model-router.js";
-import {
-  DEFAULT_OPENAI_MODEL, isRetryableOpenAIError, openAIErrorCategory, OpenAIModelRouter,
-} from "../src/openai-model-router.js";
+import { createModelFailure, type ModelAttemptDiagnostic, type ModelRouter, type ModelRouterResult } from "../src/model-router.js";
+import { DEFAULT_OPENAI_MODEL, OpenAIModelRouter } from "../src/openai-model-router.js";
 import { modelMaximumAttempts, ReliableModelSelector } from "../src/reliable-model-selector.js";
 
 const none: ModelRouterResult = { selection: { kind: "none" }, usage: { kind: "unavailable" } };
@@ -59,6 +57,100 @@ describe("ReliableModelSelector", () => {
     });
   });
 
+  it("accepts approved provider-neutral HTTP failure metadata from a non-OpenAI router", async () => {
+    const attempts: ModelAttemptDiagnostic[] = [];
+    let calls = 0;
+    const router: ModelRouter = { async selectTool() {
+      calls += 1;
+      if (calls === 1) throw createModelFailure("http_5xx", true, "Private local provider detail", 503);
+      return none;
+    } };
+    const selector = new ReliableModelSelector(router, {
+      maximumAttempts: 2, jitter: () => 0, delay: async () => undefined,
+    });
+
+    await selector.selectTool("list", [], new AbortController().signal, {
+      timeoutMs: 2_000, onAttempt: (value) => attempts.push(value),
+    });
+
+    assert.equal(calls, 2);
+    assert.deepEqual(attempts.map(({ outcome, retryDecision, failureCategory }) => (
+      { outcome, retryDecision, failureCategory }
+    )), [
+      { outcome: "failure", retryDecision: "retry", failureCategory: "http_5xx" },
+      { outcome: "success", retryDecision: "not_needed", failureCategory: undefined },
+    ]);
+  });
+
+  it("fails closed for untrusted and invalid failure metadata", async () => {
+    let calls = 0;
+    const selector = new ReliableModelSelector({ async selectTool() {
+      calls += 1;
+      throw new Error("http_429 is untrusted text");
+    } }, { maximumAttempts: 2, delay: async () => assert.fail("must not retry") });
+
+    await assert.rejects(selector.selectTool("x", [], new AbortController().signal, { timeoutMs: 2_000 }));
+    assert.equal(calls, 1);
+    assert.throws(() => createModelFailure("invalid" as never, true), /invalid model failure metadata/i);
+    assert.throws(() => createModelFailure("unknown", "true" as never), /invalid model failure metadata/i);
+    assert.throws(() => createModelFailure("http_429", true, "private", 99), /invalid model failure metadata/i);
+  });
+
+  it("normalizes unsafe retry combinations and custom predicates cannot bypass the policy", async () => {
+    const categories = ["unknown", "http_400", "network_failure", "request_timeout"] as const;
+    for (const category of categories) {
+      let calls = 0;
+      const failure = createModelFailure(category, true, "private");
+      const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
+        maximumAttempts: 2,
+        isRetryable: () => true,
+        delay: async () => assert.fail("must not retry"),
+      });
+      await assert.rejects(selector.selectTool("x", [], new AbortController().signal, { timeoutMs: 2_000 }));
+      assert.equal(calls, 1, `${category} must not retry`);
+    }
+  });
+
+  it("retries only trusted failures with explicitly approved HTTP statuses", async () => {
+    for (const status of [429, 500, 502, 503, 504]) {
+      let calls = 0;
+      const category = status === 429 ? "http_429" : "http_5xx";
+      const failure = createModelFailure(category, true, "private", status);
+      const selector = new ReliableModelSelector({ async selectTool() { calls += 1; if (calls === 1) throw failure; return none; } }, {
+        maximumAttempts: 2, jitter: () => 0, delay: async () => undefined,
+      });
+      await selector.selectTool("x", [], new AbortController().signal, { timeoutMs: 2_000 });
+      assert.equal(calls, 2, `HTTP ${status} should retry once`);
+    }
+
+    for (const status of [501, 505, 599]) {
+      let calls = 0;
+      const failure = createModelFailure("http_5xx", true, "private", status);
+      const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
+        maximumAttempts: 2, isRetryable: () => true, delay: async () => assert.fail("must not retry"),
+      });
+      await assert.rejects(selector.selectTool("x", [], new AbortController().signal, { timeoutMs: 2_000 }));
+      assert.equal(calls, 1, `HTTP ${status} must not retry`);
+    }
+  });
+
+  it("ignores forged properties and post-creation metadata mutation", async () => {
+    const forged = Object.assign(new Error("private"), { category: "http_429", retryable: true, httpStatus: 429 });
+    const trusted = Object.assign(createModelFailure("unknown", true, "private"), {
+      category: "http_429", retryable: true, httpStatus: 429,
+    });
+    const missing429Status = createModelFailure("http_429", true, "private");
+    const missing5xxStatus = createModelFailure("http_5xx", true, "private");
+    for (const failure of [forged, trusted, missing429Status, missing5xxStatus]) {
+      let calls = 0;
+      const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
+        maximumAttempts: 2, isRetryable: () => true, delay: async () => assert.fail("must not retry"),
+      });
+      await assert.rejects(selector.selectTool("x", [], new AbortController().signal, { timeoutMs: 2_000 }));
+      assert.equal(calls, 1);
+    }
+  });
+
   for (const status of [429, 503] as const) {
     it(`retries HTTP ${status} once and then succeeds`, async () => {
       const attempts: ModelAttemptDiagnostic[] = [];
@@ -78,8 +170,6 @@ describe("ReliableModelSelector", () => {
         monotonicNow: () => now,
         jitter: () => 0,
         delay: async (ms) => { assert.equal(ms, 250); now += ms; },
-        isRetryable: isRetryableOpenAIError,
-        failureCategory: openAIErrorCategory,
       });
       const result = await selector.selectTool("hello", [], new AbortController().signal, {
         timeoutMs: 2_000, onAttempt: (value) => attempts.push(value),
@@ -141,7 +231,7 @@ describe("ReliableModelSelector", () => {
   it("aborts during backoff without starting a second attempt", async () => {
     const controller = new AbortController();
     let calls = 0;
-    const retryable = new Error("private");
+    const retryable = createModelFailure("http_429", true, "private", 429);
     const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw retryable; } }, {
       maximumAttempts: 2,
       isRetryable: (error) => error === retryable,
@@ -157,7 +247,7 @@ describe("ReliableModelSelector", () => {
 
   it("does not retry when the deadline cannot contain backoff plus another attempt", async () => {
     let calls = 0;
-    const failure = new Error("private");
+    const failure = createModelFailure("http_5xx", true, "private", 503);
     const diagnostics: ModelAttemptDiagnostic[] = [];
     const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
       maximumAttempts: 2, monotonicNow: () => 0, jitter: () => 0,
@@ -202,8 +292,6 @@ describe("ReliableModelSelector", () => {
       monotonicNow: () => clockValues[clockIndex++] ?? 1_001,
       jitter: () => 0,
       delay: async (ms) => { assert.equal(ms, 250); },
-      isRetryable: isRetryableOpenAIError,
-      failureCategory: openAIErrorCategory,
     });
     const gateway = new FakeGateway();
 
@@ -240,7 +328,7 @@ describe("ReliableModelSelector", () => {
   it("re-enforces the minimum second-attempt budget after a delayed backoff", async () => {
     let calls = 0;
     let now = 0;
-    const failure = new Error("private");
+    const failure = createModelFailure("http_5xx", true, "private", 503);
     const selector = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
       maximumAttempts: 2,
       monotonicNow: () => now,
@@ -260,7 +348,7 @@ describe("ReliableModelSelector", () => {
     const controller = new AbortController();
     let calls = 0;
     let delays = 0;
-    const failure = new Error("private");
+    const failure = createModelFailure("http_5xx", true, "private", 503);
     const selector = new ReliableModelSelector({ async selectTool() {
       calls += 1;
       controller.abort();
@@ -292,7 +380,7 @@ describe("ReliableModelSelector", () => {
       originalRemove(type, listener, options);
     }) as typeof signal.removeEventListener;
     let calls = 0;
-    const failure = new Error("private");
+    const failure = createModelFailure("http_5xx", true, "private", 503);
     const operation = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
       maximumAttempts: 2, jitter: () => 0, isRetryable: (error) => error === failure,
     }).selectTool("x", [], signal, { timeoutMs: 2_000 });
@@ -321,7 +409,7 @@ describe("ReliableModelSelector", () => {
 
   it("does not retry an invalid model response after one eligible failure and executes zero MCP tools", async () => {
     let calls = 0;
-    const retryableFailure = new Error("private retryable failure");
+    const retryableFailure = createModelFailure("http_5xx", true, "private retryable failure", 503);
     const adapter: ModelRouter = { async selectTool() {
       calls += 1;
       if (calls === 1) throw retryableFailure;
@@ -340,7 +428,7 @@ describe("ReliableModelSelector", () => {
 
   it("executes exactly one MCP tool after a retry succeeds and ignores cleanup failure", async () => {
     let calls = 0;
-    const failure = new Error("retryable");
+    const failure = createModelFailure("http_5xx", true, "retryable", 503);
     const adapter: ModelRouter = { async selectTool() { calls += 1; if (calls === 1) throw failure; return call; } };
     const gateway = new FakeGateway(true);
     const selector = new ReliableModelSelector(adapter, {
@@ -360,7 +448,6 @@ function openAIFailureAdapter(factory: () => unknown): OpenAIModelRouter {
 function reliableOpenAI(adapter: ModelRouter, overrides: { delay?: (ms: number, signal: AbortSignal) => Promise<void> } = {}): ReliableModelSelector {
   return new ReliableModelSelector(adapter, {
     maximumAttempts: 2, jitter: () => 0, delay: overrides.delay ?? (async () => undefined),
-    isRetryable: isRetryableOpenAIError, failureCategory: openAIErrorCategory,
   });
 }
 

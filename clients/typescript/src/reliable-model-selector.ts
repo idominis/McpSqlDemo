@@ -1,4 +1,5 @@
 import type {
+  ModelFailureCategory,
   ModelAttemptDiagnostic,
   ModelRequestOptions,
   ModelRouter,
@@ -6,6 +7,7 @@ import type {
   ModelToolDefinition,
   RetryDecision,
 } from "./model-router.js";
+import { isRetryableModelFailure, modelFailureCategory } from "./model-router.js";
 
 export const DEFAULT_MODEL_MAX_ATTEMPTS = 1;
 export const MODEL_RETRY_BASE_DELAY_MS = 500;
@@ -18,7 +20,7 @@ export interface ReliableModelSelectorOptions {
   readonly jitter?: () => number;
   readonly delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly isRetryable?: (error: unknown) => boolean;
-  readonly failureCategory?: (error: unknown) => string | undefined;
+  readonly failureCategory?: (error: unknown) => ModelFailureCategory | undefined;
   readonly outputTokenLimit?: number;
 }
 
@@ -29,7 +31,7 @@ export class ReliableModelSelector implements ModelRouter {
   private readonly jitter: () => number;
   private readonly wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   private readonly retryable: (error: unknown) => boolean;
-  private readonly categorize: (error: unknown) => string | undefined;
+  private readonly categorize: (error: unknown) => ModelFailureCategory | undefined;
   private readonly outputTokenLimit: number;
 
   public constructor(private readonly adapter: ModelRouter, options: ReliableModelSelectorOptions = {}) {
@@ -38,8 +40,8 @@ export class ReliableModelSelector implements ModelRouter {
     this.now = options.monotonicNow ?? (() => performance.now());
     this.jitter = options.jitter ?? Math.random;
     this.wait = options.delay ?? abortableDelay;
-    this.retryable = options.isRetryable ?? (() => false);
-    this.categorize = options.failureCategory ?? (() => undefined);
+    this.retryable = options.isRetryable ?? isRetryableModelFailure;
+    this.categorize = options.failureCategory ?? modelFailureCategory;
     this.outputTokenLimit = options.outputTokenLimit ?? 256;
   }
 
@@ -86,7 +88,7 @@ export class ReliableModelSelector implements ModelRouter {
         let backoffMs: number | undefined;
         if (signal.aborted) decision = "canceled";
         else if (currentRemaining <= 0) decision = "deadline_exhausted";
-        else if (!this.retryable(error)) decision = "not_retryable";
+        else if (!this.retryable(error) || !isRetryableModelFailure(error)) decision = "not_retryable";
         else if (attempt >= this.maximumAttempts) decision = "attempt_limit";
         else {
           const candidateBackoffMs = equalJitterBackoff(attempt, this.jitter);

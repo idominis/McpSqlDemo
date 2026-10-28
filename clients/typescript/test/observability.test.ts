@@ -5,9 +5,9 @@ import { APIError, APIUserAbortError } from "openai";
 import { AgentError, NO_TOOL_MESSAGE, runAgentQuestion, type AgentLimits } from "../src/agent.js";
 import type { McpGateway } from "../src/agent-mcp.js";
 import type { DiscoveredTool, TrustedToolName } from "../src/contracts.js";
-import type { ModelRouter, ModelRouterResult, ModelSelection, ModelUsage } from "../src/model-router.js";
+import { createModelFailure, type ModelRouter, type ModelRouterResult, type ModelSelection, type ModelUsage } from "../src/model-router.js";
 import type { DiagnosticsOptions } from "../src/observability.js";
-import { DEFAULT_OPENAI_MODEL, isRetryableOpenAIError, openAIErrorCategory, OpenAIModelRouter } from "../src/openai-model-router.js";
+import { DEFAULT_OPENAI_MODEL, OpenAIModelRouter } from "../src/openai-model-router.js";
 import { ReliableModelSelector } from "../src/reliable-model-selector.js";
 
 const correlationId = "11111111-2222-4333-8444-555555555555";
@@ -225,6 +225,23 @@ describe("secure agent diagnostics", () => {
     ]);
   });
 
+  it("records a neutral category from a non-OpenAI router without provider-specific types", async () => {
+    const secret = "SECRET LOCAL PROVIDER FAILURE";
+    const router: ModelRouter = { async selectTool() {
+      throw createModelFailure("request_timeout", false, secret);
+    } };
+    const captured = captureDiagnostics();
+
+    await assert.rejects(
+      runAgentQuestion("SECRET PROMPT", router, new FakeGateway(jsonResult([])), new AbortController().signal, undefined, captured.options),
+      (error: unknown) => error instanceof AgentError && error.code === "model_failed",
+    );
+
+    const modelEvent = captured.events.find((event) => event.stage === "model_selection");
+    assert.equal(modelEvent?.error_category, "request_timeout");
+    assertNoSentinels(captured.events, [secret, "SECRET PROMPT"]);
+  });
+
   it("emits allowlisted retry metadata and marks retry usage incomplete", async () => {
     const secret = "SECRET-RETRY-MATERIAL";
     let request = 0;
@@ -235,7 +252,6 @@ describe("secure agent diagnostics", () => {
     } }, DEFAULT_OPENAI_MODEL);
     const router = new ReliableModelSelector(adapter, {
       maximumAttempts: 2, jitter: () => 0, delay: async () => undefined,
-      isRetryable: isRetryableOpenAIError, failureCategory: openAIErrorCategory,
     });
     const captured = captureDiagnostics();
     const result = await runAgentQuestion(
@@ -282,7 +298,7 @@ describe("secure agent diagnostics", () => {
 
   it("preserves partial retry usage metadata when second-attempt local validation fails", async () => {
     const captured = captureDiagnostics();
-    const retryable = new Error("SECRET RETRY FAILURE");
+    const retryable = createModelFailure("http_5xx", true, "SECRET RETRY FAILURE", 503);
     let calls = 0;
     const router = new ReliableModelSelector({ async selectTool() {
       calls += 1;
@@ -309,7 +325,7 @@ describe("secure agent diagnostics", () => {
 
   it("reports incomplete unknown usage when both provider attempts fail", async () => {
     const captured = captureDiagnostics();
-    const failure = new Error("SECRET PROVIDER FAILURE");
+    const failure = createModelFailure("http_5xx", true, "SECRET PROVIDER FAILURE", 503);
     let calls = 0;
     const router = new ReliableModelSelector({ async selectTool() { calls += 1; throw failure; } }, {
       maximumAttempts: 2, isRetryable: (error) => error === failure, delay: async () => undefined,
@@ -400,7 +416,7 @@ describe("secure agent diagnostics", () => {
         && error.message === "The model request failed.",
     );
     let retryCalls = 0;
-    const retryFailure = new Error("private retry failure");
+    const retryFailure = createModelFailure("http_429", true, "private retry failure", 429);
     const retrying = new ReliableModelSelector({ async selectTool() {
       retryCalls += 1;
       if (retryCalls === 1) throw retryFailure;

@@ -8,9 +8,16 @@ import {
   type ShipmentStatus,
   type TrustedToolName,
 } from "./contracts.js";
-import type { ModelAttemptDiagnostic, ModelReliability, ModelRouter, ModelSelection, ModelUsage } from "./model-router.js";
+import {
+  modelFailureCategory,
+  type ModelAttemptDiagnostic,
+  type ModelFailureCategory,
+  type ModelReliability,
+  type ModelRouter,
+  type ModelSelection,
+  type ModelUsage,
+} from "./model-router.js";
 import { AgentDiagnostics, type CompletionKind, type DiagnosticsOptions, type OperationalOutcome } from "./observability.js";
-import { openAIErrorCategory, type OpenAIErrorCategory } from "./openai-model-router.js";
 import { MAX_TOOL_RESULT_BYTES, readJsonToolResult } from "./response.js";
 
 export const MAX_QUESTION_CHARACTERS = 2_000;
@@ -145,7 +152,7 @@ async function runAgentCore(
   const modelStart = diagnostics.monotonicNow();
   let usage: ModelUsage = { kind: "unavailable" };
   let reliability: ModelReliability | undefined;
-  let errorCategory: OpenAIErrorCategory | undefined;
+  let errorCategory: ModelFailureCategory | undefined;
   let lastAttempt: ModelAttemptDiagnostic | undefined;
   let call: ValidatedCall | undefined;
   try {
@@ -160,7 +167,7 @@ async function runAgentCore(
             },
           });
         } catch (error: unknown) {
-          errorCategory = openAIErrorCategory(error);
+          errorCategory = modelFailureCategory(error);
           throw error;
         }
       }, overallSignal, limits.modelMs,
