@@ -151,6 +151,13 @@ The secure agent uses one model attempt by default. Setting `MCP_MODEL_MAX_ATTEM
 
 GitHub Actions runs on Ubuntu for pushes to `main` and pull requests targeting `main`. It builds the MCP server in Release configuration and runs the MCP server unit tests plus both security-lab test projects. It also installs Node.js LTS and runs `npm ci`, typechecking, build, and isolated unit tests for the TypeScript client. SQL Server and MCP stdio integration tests are skipped cleanly because CI provides no SQL connection, no launcher path, and leaves their explicit opt-ins disabled; the workflow does not require SQL Server, LocalDB, DPAPI, or repository secrets and never starts the real launcher.
 
+## Architecture documentation
+
+- [Legacy enterprise integration blueprint](docs/architecture/legacy-integration-blueprint.md)
+- [Trust boundaries and data flow](docs/architecture/trust-boundaries.md)
+- [MCP contract versioning policy](docs/architecture/mcp-contract-versioning.md)
+- [ADR-0001: Model selection without data feedback](docs/architecture/adr/0001-model-selection-without-data-feedback.md)
+
 ## Architecture
 Codex (MCP client) -> stdio -> C# MCP server -> SqlClient (parameterized SELECT) -> SQL Server test DB.
 
